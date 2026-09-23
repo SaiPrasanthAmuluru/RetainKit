@@ -2,7 +2,7 @@
 // https://docs.swift.org/swift-book
 
 @main
-struct retaikit {
+struct retainkit {
     static func main() {
         print("Hello, world!")
     }
