@@ -1,0 +1,24 @@
+{
+  "configurations" : [
+    {
+      "id" : "260D1F27-2A86-4DD2-9BF5-A18C58632311",
+      "name" : "Configuration 1",
+      "options" : {
+
+      }
+    }
+  ],
+  "defaultOptions" : {
+
+  },
+  "testTargets" : [
+    {
+      "target" : {
+        "containerPath" : "container:",
+        "identifier" : "RetainKitTests",
+        "name" : "RetainKitTests"
+      }
+    }
+  ],
+  "version" : 1
+}
