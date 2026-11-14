@@ -1,0 +1,28 @@
+name: Forge review
+
+# First review: PR opened (non-draft), draft marked ready, or label forge-review added.
+# Re-review: pushes, but only after the PR has been reviewed once (forge-reviewed label).
+on:
+  pull_request:
+    types: [opened, ready_for_review, labeled, synchronize]
+
+jobs:
+  review:
+    if: >-
+      github.event.pull_request.draft == false && (
+        github.event.action == 'opened' ||
+        github.event.action == 'ready_for_review' ||
+        (github.event.action == 'labeled' && github.event.label.name == 'forge-review') ||
+        (github.event.action == 'synchronize' &&
+         contains(github.event.pull_request.labels.*.name, 'forge-reviewed'))
+      )
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    uses: SaiPrasanthAmuluru/Forge-guide/.github/workflows/pr-review.yml@v0.1.4
+    with:
+      forge_ref: v0.1.4
+      mode: standard
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
