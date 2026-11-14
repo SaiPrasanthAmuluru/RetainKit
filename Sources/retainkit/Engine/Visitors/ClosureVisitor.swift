@@ -120,32 +120,54 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         return .implicitSelf
     }
 
-    /// Returns true if the closure is assigned to a property or
-    /// appended to a collection.
+    /// Returns true if the closure itself is the value being stored:
+    /// the initializer of a binding, the right-hand side of an assignment,
+    /// or an argument of `append` / `insert`.
+    ///
+    /// Only the closure's immediate context counts. A closure that merely
+    /// sits somewhere inside such an expression (`let names = items.map { ... }`)
+    /// is not stored — its result is.
     private func isStoredInProperty(_ node: ClosureExprSyntax) -> Bool {
-        var parent = node.parent
-        while let current = parent {
-            if current.is(PatternBindingSyntax.self) { return true }
+        guard let parent = node.parent else { return false }
 
-            if let call = current.as(FunctionCallExprSyntax.self) {
-                let name = call.calledExpression
-                    .as(MemberAccessExprSyntax.self)?
-                    .declName.baseName.text ?? ""
-                if name == "append" || name == "insert" { return true }
-            }
-
-            // handler = { ... } is SequenceExprSyntax in SwiftSyntax 510
-            if let sequence = current.as(SequenceExprSyntax.self) {
-                let elements = Array(sequence.elements)
-                if elements.count == 3,
-                   elements[1].is(AssignmentExprSyntax.self) {
-                    return true
-                }
-            }
-
-            parent = current.parent
+        // var handler: () -> Void = { ... }
+        if parent.is(InitializerClauseSyntax.self),
+           parent.parent?.is(PatternBindingSyntax.self) == true {
+            return true
         }
+
+        // handler = { ... } is an unfolded SequenceExprSyntax in SwiftSyntax 510:
+        // the closure must be the element right after the `=`.
+        if let elements = parent.as(ExprListSyntax.self),
+           parent.parent?.is(SequenceExprSyntax.self) == true {
+            let list = Array(elements)
+            if let index = list.firstIndex(where: { $0.id == node.id }),
+               index > 0,
+               list[index - 1].is(AssignmentExprSyntax.self) {
+                return true
+            }
+        }
+
+        // callbacks.append { ... }
+        if let call = parent.as(FunctionCallExprSyntax.self),
+           call.trailingClosure?.id == node.id {
+            return isCollectionInsertion(call)
+        }
+
+        // callbacks.append({ ... }) / callbacks.insert({ ... }, at: 0)
+        if parent.is(LabeledExprSyntax.self),
+           let call = parent.parent?.parent?.as(FunctionCallExprSyntax.self) {
+            return isCollectionInsertion(call)
+        }
+
         return false
+    }
+
+    private func isCollectionInsertion(_ call: FunctionCallExprSyntax) -> Bool {
+        let name = call.calledExpression
+            .as(MemberAccessExprSyntax.self)?
+            .declName.baseName.text
+        return name == "append" || name == "insert"
     }
 
     // MARK: - Helpers

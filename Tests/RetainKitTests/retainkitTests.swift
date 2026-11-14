@@ -168,6 +168,83 @@ final class RetainKitTests: XCTestCase {
         visitor.walk(parse(source))
         XCTAssertFalse(visitor.issues.isEmpty,
                        "Closure appended to array capturing self should be flagged")
+        XCTAssertEqual(visitor.issues.first?.kind, .storedClosure)
+    }
+
+    func testClosureVisitor_storedPropertyInitializerIsStored() {
+        let source = """
+        class Foo {
+            var y = 0
+            lazy var h: () -> Void = { self.y += 1 }
+        }
+        """
+        let visitor = ClosureVisitor(filePath: "Foo.swift", source: source)
+        visitor.walk(parse(source))
+        XCTAssertEqual(visitor.issues.map(\.kind), [.storedClosure])
+    }
+
+    func testClosureVisitor_closureInsideBindingInitializerIsNotStored() {
+        let source = """
+        class Foo {
+            var items: [Int] = []
+            func bar() {
+                let names = items.map { self.format($0) }
+                _ = names
+            }
+            func format(_ i: Int) -> String { "\\(i)" }
+        }
+        """
+        let visitor = ClosureVisitor(filePath: "Foo.swift", source: source)
+        visitor.walk(parse(source))
+        XCTAssertFalse(visitor.issues.contains { $0.kind == .storedClosure },
+                       "A closure passed to map is not stored just because the result is bound")
+    }
+
+    func testClosureVisitor_closureInsideAssignmentIsNotStored() {
+        let source = """
+        class Foo {
+            var items: [Int] = []
+            var total = 0
+            func bar() {
+                total = items.reduce(0) { $0 + self.weight($1) }
+            }
+            func weight(_ i: Int) -> Int { i }
+        }
+        """
+        let visitor = ClosureVisitor(filePath: "Foo.swift", source: source)
+        visitor.walk(parse(source))
+        XCTAssertFalse(visitor.issues.contains { $0.kind == .storedClosure })
+    }
+
+    func testClosureVisitor_closureNestedInAppendArgumentIsNotStored() {
+        let source = """
+        class Foo {
+            var items: [Int] = []
+            var all: [[Int]] = []
+            var x = 1
+            func bar() {
+                all.append(items.map { $0 * self.x })
+            }
+        }
+        """
+        let visitor = ClosureVisitor(filePath: "Foo.swift", source: source)
+        visitor.walk(parse(source))
+        XCTAssertFalse(visitor.issues.contains { $0.kind == .storedClosure })
+    }
+
+    func testClosureVisitor_closurePassedAsAppendArgumentIsStored() {
+        let source = """
+        class Foo {
+            var callbacks: [() -> Void] = []
+            func add() {
+                callbacks.insert({ self.update() }, at: 0)
+            }
+            func update() {}
+        }
+        """
+        let visitor = ClosureVisitor(filePath: "Foo.swift", source: source)
+        visitor.walk(parse(source))
+        XCTAssertEqual(visitor.issues.map(\.kind), [.storedClosure])
     }
 
     func testClosureVisitor_doesNotFlagClosureWithoutSelf() {
