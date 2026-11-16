@@ -44,8 +44,11 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
 
     /// Where a closure ends up, which decides whether it can retain `self`.
     private enum Destination {
-        /// Initializer of a binding or right-hand side of an assignment.
+        /// Initializer of a property or right-hand side of an assignment.
         case stored
+        /// Initializer of a local `let`/`var`. It leaks only if that variable
+        /// is itself stored or passed somewhere that outlives the function.
+        case local
         /// Argument of `append` / `insert`.
         case collection
         /// Passed to an API listed in `KnownEscaping.escaping`.
@@ -73,9 +76,13 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         let kind = resolveKind(node, destination: destination)
         let loc = location(of: node)
 
-        // An unknown callee may or may not escape: report it, but only as a hint.
+        // An unknown callee or a local variable may or may not escape:
+        // report it, but only as a hint.
         var severity: IssueSeverity?
-        if case .unknown = destination { severity = .hint }
+        switch destination {
+        case .unknown, .local: severity = .hint
+        default: break
+        }
 
         issues.append(LeakIssue(
             kind: kind,
@@ -199,7 +206,7 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
             return .storedClosure
         case .collection:
             return .closureInCollection
-        case .escapingCall, .unknown, .nonEscaping:
+        case .escapingCall, .unknown, .local, .nonEscaping:
             // `[self]` is a deliberate strong capture; no capture list is LC-W002.
             return hasExplicitSelfCapture(node) ? .escapingClosure : .implicitSelf
         }
@@ -215,8 +222,8 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
 
         // var handler: () -> Void = { ... }
         if parent.is(InitializerClauseSyntax.self),
-           parent.parent?.is(PatternBindingSyntax.self) == true {
-            return .stored
+           let binding = parent.parent?.as(PatternBindingSyntax.self) {
+            return isProperty(binding) ? .stored : .local
         }
 
         // handler = { ... } is an unfolded SequenceExprSyntax in SwiftSyntax 510:
@@ -254,6 +261,12 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         return .unknown(nil)
     }
 
+    /// True when the binding is a member of a type, not a local variable.
+    /// PatternBinding → PatternBindingList → VariableDecl → MemberBlockItem.
+    private func isProperty(_ binding: PatternBindingSyntax) -> Bool {
+        binding.parent?.parent?.parent?.is(MemberBlockItemSyntax.self) == true
+    }
+
     private func destination(ofArgumentTo call: FunctionCallExprSyntax) -> Destination {
         guard let name = calleeName(of: call) else { return .unknown(nil) }
         if name == "append" || name == "insert" { return .collection }
@@ -284,7 +297,10 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         switch destination {
         case .stored:
             escapeLabel = "Closure is stored"
-            escapeDetail = "Initializer of a binding or right-hand side of an assignment"
+            escapeDetail = "Initializer of a property or right-hand side of an assignment"
+        case .local:
+            escapeLabel = "Escape not known"
+            escapeDetail = "Assigned to a local variable; reported as a hint"
         case .collection:
             escapeLabel = "Closure is stored"
             escapeDetail = "Argument of append/insert"

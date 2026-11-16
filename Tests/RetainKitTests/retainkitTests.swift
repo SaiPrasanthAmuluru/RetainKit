@@ -1149,4 +1149,57 @@ final class RetainKitTests: XCTestCase {
         XCTAssertEqual(closureIssues(source).map(\.line), [3, 13],
                        "Class and actor are flagged; the struct nested in a class is not")
     }
+
+    // MARK: - Local closure bindings
+
+    func testClosureVisitor_localBindingIsHintNotStored() {
+        let source = """
+        class Foo {
+            func bar() {
+                let handler = { self.update() }
+                handler()
+            }
+            func update() {}
+        }
+        """
+        let issues = closureIssues(source)
+        XCTAssertEqual(issues.map(\.kind), [.implicitSelf])
+        XCTAssertEqual(issues.map(\.severity), [.hint])
+        XCTAssertEqual(issues[0].detectionTrail[2].detail,
+                       "Assigned to a local variable; reported as a hint")
+    }
+
+    func testClosureVisitor_localBindingInsideClosureIsHint() {
+        let source = """
+        class Foo {
+            var items: [Int] = []
+            func bar() {
+                items.forEach { _ in
+                    var work: () -> Void = { [self] in self.update() }
+                    work()
+                }
+            }
+            func update() {}
+        }
+        """
+        let issues = closureIssues(source)
+        XCTAssertEqual(issues.map(\.kind), [.escapingClosure])
+        XCTAssertEqual(issues.map(\.severity), [.hint])
+    }
+
+    func testClosureVisitor_propertyInitializerIsStillStoredError() {
+        let source = """
+        class Foo {
+            var x = 0
+            lazy var handler: () -> Void = { self.x += 1 }
+            class Inner {
+                var y = 0
+                lazy var handler = { self.y += 1 }
+            }
+        }
+        """
+        let issues = closureIssues(source)
+        XCTAssertEqual(issues.map(\.kind), [.storedClosure, .storedClosure])
+        XCTAssertEqual(issues.map(\.severity), [.error, .error])
+    }
 }
