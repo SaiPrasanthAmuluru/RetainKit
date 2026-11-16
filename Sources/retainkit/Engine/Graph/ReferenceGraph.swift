@@ -42,6 +42,10 @@ struct GraphEdge {
 /// values and single-argument generics (`Array<B>`, `Set<B>`) are unwrapped
 /// to the type they contain.
 ///
+/// Edges are between types, not instances. A class that refers to its own
+/// type (`var next: Node?`) is a normal linked list or tree, so it is reported
+/// as a hint, not as a cycle.
+///
 /// One graph covers one file. Use `merge(_:)` to combine the graphs of several
 /// files before calling `detectCycles()`, so cycles that span files are found.
 final class ReferenceGraph: SyntaxVisitor, SourceLocating {
@@ -150,6 +154,12 @@ final class ReferenceGraph: SyntaxVisitor, SourceLocating {
         for edge in node.edges {
             guard nodes[edge.to] != nil else { continue }
 
+            // A type that refers to itself is not a cycle between instances.
+            if edge.to == current {
+                reportSelfReference(edge)
+                continue
+            }
+
             if !visited.contains(edge.to) {
                 dfs(
                     current: edge.to,
@@ -189,6 +199,30 @@ final class ReferenceGraph: SyntaxVisitor, SourceLocating {
                 breakEdge: breakEdge,
                 matchedKeyword: keywordEdge != nil
             )
+        ))
+    }
+
+    private func reportSelfReference(_ edge: GraphEdge) {
+        let property = "\(edge.from).\(edge.propertyName)"
+        issues.append(LeakIssue(
+            kind: .referenceCycle,
+            severity: .hint,
+            filePath: edge.filePath,
+            line: edge.line,
+            column: 1,
+            message: "\(property): type refers to itself",
+            codeSnippet: edge.codeSnippet,
+            suggestion: "Fine for a list or tree. Make \(edge.propertyName) weak only if an instance can point back at one that already holds it",
+            detectionTrail: [
+                TrailStep(step: 1, label: "Parsed file",
+                          detail: "SwiftSyntax → AST"),
+                TrailStep(step: 2, label: "Graph built",
+                          detail: "\(nodes.count) classes analysed"),
+                TrailStep(step: 3, label: "Self-reference found",
+                          detail: "\(property) has type \(edge.to)"),
+                TrailStep(step: 4, label: "Not a proven cycle",
+                          detail: "The graph tracks types, not instances; reported as a hint")
+            ]
         ))
     }
 

@@ -53,8 +53,8 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         // 1. Does this closure reference self at all?
         guard closureReferencesSelf(node) else { return }
 
-        // 2. Is self captured weakly or unowned?
-        if hasSafeCapture(node) { return }
+        // 2. Is self captured weakly or unowned, here or in an enclosing closure?
+        if hasSafeCapture(node) || usesWeakSelfOfEnclosingClosure(node) { return }
 
         // 3. Can the closure outlive the call it appears in?
         let destination = resolveDestination(node)
@@ -116,6 +116,45 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
                 .baseName.text == "self"
             return isWeakOrUnowned && capturesSelf
         }
+    }
+
+    /// Returns true if `self` inside this closure is the weak or unowned
+    /// binding of an enclosing closure, so this closure holds no strong reference:
+    ///
+    ///     queue.async { [weak self] in
+    ///         other.async { self?.update() }   // captures the weak `self`
+    ///     }
+    ///
+    /// If the enclosing closure rebinds `self` strongly before this one
+    /// (`guard let self`), this closure captures that strong reference and
+    /// is still reported.
+    private func usesWeakSelfOfEnclosingClosure(_ node: ClosureExprSyntax) -> Bool {
+        // A capture list on this closure decides for itself.
+        guard !hasExplicitSelfCapture(node) else { return false }
+
+        var ancestor = node.parent
+        while let current = ancestor {
+            // `self` means something else outside the enclosing type.
+            if current.is(ClassDeclSyntax.self) || current.is(StructDeclSyntax.self)
+                || current.is(ActorDeclSyntax.self) || current.is(EnumDeclSyntax.self)
+                || current.is(ExtensionDeclSyntax.self) {
+                return false
+            }
+            if let closure = current.as(ClosureExprSyntax.self), hasExplicitSelfCapture(closure) {
+                // The nearest closure that captures self decides what `self` is here.
+                return hasSafeCapture(closure)
+                    && !rebindsSelfStrongly(in: closure, before: node)
+            }
+            ancestor = current.parent
+        }
+        return false
+    }
+
+    /// True if `closure` contains `guard let self` / `if let self` ahead of `node`.
+    private func rebindsSelfStrongly(in closure: ClosureExprSyntax, before node: ClosureExprSyntax) -> Bool {
+        let finder = SelfRebindingFinder(before: node.position)
+        finder.walk(closure.statements)
+        return finder.found
     }
 
     // MARK: - Kind Resolution
@@ -240,6 +279,27 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
             TrailStep(step: 5, label: "self used in closure",
                       detail: "`self` appears in the capture list or body")
         ]
+    }
+}
+
+// MARK: - Self Rebinding Finder
+
+/// Finds `guard let self` / `if let self = self` that starts before a position.
+private final class SelfRebindingFinder: SyntaxVisitor {
+    private(set) var found = false
+    private let limit: AbsolutePosition
+
+    init(before limit: AbsolutePosition) {
+        self.limit = limit
+        super.init(viewMode: .sourceAccurate)
+    }
+
+    override func visit(_ node: OptionalBindingConditionSyntax) -> SyntaxVisitorContinueKind {
+        if node.position < limit,
+           node.pattern.as(IdentifierPatternSyntax.self)?.identifier.text == "self" {
+            found = true
+        }
+        return .visitChildren
     }
 }
 

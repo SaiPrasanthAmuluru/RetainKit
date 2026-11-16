@@ -966,4 +966,120 @@ final class RetainKitTests: XCTestCase {
         var passing = try Scan.parse([clean.path, "--json", "--fail-on-error"])
         XCTAssertNoThrow(try passing.run())
     }
+
+    // MARK: - Nested closures under [weak self]
+
+    func testClosureVisitor_skipsNestedClosureUsingOuterWeakSelf() {
+        let source = """
+        class Foo {
+            func bar(other: DispatchQueue) {
+                DispatchQueue.main.async { [weak self] in
+                    other.async { self?.update() }
+                }
+            }
+            func update() {}
+        }
+        """
+        XCTAssertTrue(closureIssues(source).isEmpty,
+                      "The inner closure captures the weak self, not a strong one")
+    }
+
+    func testClosureVisitor_skipsNestedClosureUsingOuterUnownedSelf() {
+        let source = """
+        class Foo {
+            func bar(other: DispatchQueue) {
+                DispatchQueue.main.async { [unowned self] in
+                    other.async { other.async { self.update() } }
+                }
+            }
+            func update() {}
+        }
+        """
+        XCTAssertTrue(closureIssues(source).isEmpty)
+    }
+
+    func testClosureVisitor_flagsNestedClosureAfterStrongRebinding() {
+        let source = """
+        class Foo {
+            func bar(other: DispatchQueue) {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    other.async { self.update() }
+                }
+            }
+            func update() {}
+        }
+        """
+        XCTAssertEqual(closureIssues(source).map(\.line), [5],
+                       "After guard let self, the inner closure captures a strong self")
+    }
+
+    func testClosureVisitor_innerRebindingOfWeakSelfIsNotFlagged() {
+        let source = """
+        class Foo {
+            func bar(other: DispatchQueue) {
+                DispatchQueue.main.async { [weak self] in
+                    other.async {
+                        guard let self else { return }
+                        self.update()
+                    }
+                }
+            }
+            func update() {}
+        }
+        """
+        XCTAssertTrue(closureIssues(source).isEmpty)
+    }
+
+    func testClosureVisitor_flagsNestedClosureUnderStrongSelfCapture() {
+        let source = """
+        class Foo {
+            func bar(other: DispatchQueue) {
+                DispatchQueue.main.async { [weak self] in
+                    other.async { [self] in
+                        other.async { self?.update() }
+                    }
+                }
+            }
+            func update() {}
+        }
+        """
+        XCTAssertEqual(closureIssues(source).map(\.line), [4, 5],
+                       "The nearest capturing closure is strong, so both are reported")
+    }
+
+    // MARK: - Self-referencing types
+
+    func testReferenceGraph_selfReferenceIsHintNotCycle() {
+        let source = """
+        final class ListNode { var next: ListNode? }
+        class TreeNode { var children: [TreeNode] = [] }
+        """
+        let issues = cycleIssues(source)
+        XCTAssertEqual(issues.map(\.severity), [.hint, .hint])
+        XCTAssertEqual(issues.map(\.message), [
+            "ListNode.next: type refers to itself",
+            "TreeNode.children: type refers to itself",
+        ])
+    }
+
+    func testReferenceGraph_selfReferenceDoesNotHideRealCycle() {
+        let source = """
+        class A { var next: A?; var b: B? }
+        class B { var a: A? }
+        """
+        let issues = cycleIssues(source)
+        XCTAssertEqual(issues.filter { $0.severity == .error }.map(\.message),
+                       ["Retain cycle: A.b → B.a → A"])
+        XCTAssertEqual(issues.filter { $0.severity == .hint }.count, 1)
+    }
+
+    func testScan_selfReferenceDoesNotFailOnError() throws {
+        let dir = try makeTempDirectory()
+        let file = dir.appendingPathComponent("List.swift")
+        try "final class ListNode { var next: ListNode? }\n".write(
+            to: file, atomically: true, encoding: .utf8)
+        var command = try Scan.parse([file.path, "--json", "--fail-on-error"])
+        XCTAssertNoThrow(try command.run())
+    }
 }
