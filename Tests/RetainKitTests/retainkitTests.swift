@@ -1082,4 +1082,71 @@ final class RetainKitTests: XCTestCase {
         var command = try Scan.parse([file.path, "--json", "--fail-on-error"])
         XCTAssertNoThrow(try command.run())
     }
+
+    // MARK: - Value types
+
+    func testClosureVisitor_skipsStructAndEnumMethods() {
+        let source = """
+        struct Counter {
+            var count = 0
+            func report() {
+                DispatchQueue.main.async { print(self.count) }
+            }
+        }
+        enum Mode {
+            case on, off
+            func report() {
+                DispatchQueue.main.async { print(self) }
+            }
+        }
+        """
+        XCTAssertTrue(closureIssues(source).isEmpty,
+                      "A struct or enum self is copied, not retained")
+    }
+
+    func testClosureVisitor_skipsExtensionOfValueTypeInSameFile() {
+        let source = """
+        struct Counter { var count = 0 }
+        extension Counter {
+            func report() {
+                DispatchQueue.main.async { print(self.count) }
+            }
+        }
+        """
+        XCTAssertTrue(closureIssues(source).isEmpty)
+    }
+
+    func testClosureVisitor_flagsExtensionOfUnresolvedType() {
+        let source = """
+        extension ViewController {
+            func report() {
+                DispatchQueue.main.async { self.update() }
+            }
+        }
+        """
+        XCTAssertEqual(closureIssues(source).map(\.kind), [.implicitSelf])
+    }
+
+    func testClosureVisitor_nearestEnclosingTypeDecides() {
+        let source = """
+        struct Outer {
+            class Inner {
+                func bar() { DispatchQueue.main.async { self.update() } }
+                func update() {}
+            }
+        }
+        class Host {
+            struct Value {
+                var x = 0
+                func bar() { DispatchQueue.main.async { print(self.x) } }
+            }
+            actor Worker {
+                func bar() { Task { await self.run() } }
+                func run() {}
+            }
+        }
+        """
+        XCTAssertEqual(closureIssues(source).map(\.line), [3, 13],
+                       "Class and actor are flagged; the struct nested in a class is not")
+    }
 }

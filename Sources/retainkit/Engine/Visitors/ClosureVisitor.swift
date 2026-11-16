@@ -17,8 +17,15 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
     // MARK: - Context
     let context: SourceContext
 
+    /// Names of the structs and enums declared in this file, used to
+    /// recognise `extension Point { ... }` as an extension of a value type.
+    private let valueTypeNames: Set<String>
+
     init(context: SourceContext) {
         self.context = context
+        let collector = ValueTypeNameCollector()
+        collector.walk(context.tree)
+        self.valueTypeNames = collector.names
         super.init(viewMode: .sourceAccurate)
     }
 
@@ -52,6 +59,9 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
     private func checkClosure(_ node: ClosureExprSyntax) {
         // 1. Does this closure reference self at all?
         guard closureReferencesSelf(node) else { return }
+
+        // A struct or enum `self` is copied into the closure, not retained.
+        if isInsideValueType(node) { return }
 
         // 2. Is self captured weakly or unowned, here or in an enclosing closure?
         if hasSafeCapture(node) || usesWeakSelfOfEnclosingClosure(node) { return }
@@ -101,6 +111,30 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         let finder = SelfReferenceFinder { found = true }
         finder.walk(Syntax(statements))
         return found
+    }
+
+    // MARK: - Enclosing Type
+
+    /// Returns true if the nearest enclosing type is a struct or enum, so
+    /// `self` is a value. An extension counts when it extends a struct or enum
+    /// declared in the same file; an extension of any other type is not
+    /// resolvable from syntax and is treated as a possible class.
+    private func isInsideValueType(_ node: ClosureExprSyntax) -> Bool {
+        var ancestor = node.parent
+        while let current = ancestor {
+            if current.is(StructDeclSyntax.self) || current.is(EnumDeclSyntax.self) {
+                return true
+            }
+            if current.is(ClassDeclSyntax.self) || current.is(ActorDeclSyntax.self)
+                || current.is(ProtocolDeclSyntax.self) {
+                return false
+            }
+            if let ext = current.as(ExtensionDeclSyntax.self) {
+                return valueTypeNames.contains(ext.extendedType.trimmedDescription)
+            }
+            ancestor = current.parent
+        }
+        return false
     }
 
     // MARK: - Capture Safety
@@ -279,6 +313,27 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
             TrailStep(step: 5, label: "self used in closure",
                       detail: "`self` appears in the capture list or body")
         ]
+    }
+}
+
+// MARK: - Value Type Name Collector
+
+/// Collects the names of every struct and enum declared in a file.
+private final class ValueTypeNameCollector: SyntaxVisitor {
+    private(set) var names: Set<String> = []
+
+    init() {
+        super.init(viewMode: .sourceAccurate)
+    }
+
+    override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
+        names.insert(node.name.text)
+        return .visitChildren
+    }
+
+    override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind {
+        names.insert(node.name.text)
+        return .visitChildren
     }
 }
 
