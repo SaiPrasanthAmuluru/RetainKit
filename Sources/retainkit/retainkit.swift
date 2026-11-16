@@ -1,9 +1,13 @@
-// The Swift Programming Language
-// https://docs.swift.org/swift-book
+import ArgumentParser
 
+/// RetainKit — static memory leak detection for Swift.
+/// Part of Taiju Tech open-source tooling.
 @main
-struct retainkit {
-    static func main() {
-        print("Hello, world!")
-    }
+struct RetainKit: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "retainkit",
+        abstract: "Static memory leak detection for Swift.",
+        version: "0.1.0",
+        subcommands: [Scan.self]
+    )
 }
