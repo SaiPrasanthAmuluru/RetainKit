@@ -6,6 +6,7 @@
 //
 
 import XCTest
+import ArgumentParser
 import SwiftParser
 import SwiftSyntax
 @testable import retainkit
@@ -168,7 +169,7 @@ final class RetainKitTests: XCTestCase {
         visitor.walk(parse(source))
         XCTAssertFalse(visitor.issues.isEmpty,
                        "Closure appended to array capturing self should be flagged")
-        XCTAssertEqual(visitor.issues.first?.kind, .storedClosure)
+        XCTAssertEqual(visitor.issues.first?.kind, .closureInCollection)
     }
 
     func testClosureVisitor_storedPropertyInitializerIsStored() {
@@ -196,8 +197,8 @@ final class RetainKitTests: XCTestCase {
         """
         let visitor = ClosureVisitor(filePath: "Foo.swift", source: source)
         visitor.walk(parse(source))
-        XCTAssertFalse(visitor.issues.contains { $0.kind == .storedClosure },
-                       "A closure passed to map is not stored just because the result is bound")
+        XCTAssertTrue(visitor.issues.isEmpty,
+                      "map is non-escaping: binding its result stores no closure")
     }
 
     func testClosureVisitor_closureInsideAssignmentIsNotStored() {
@@ -232,7 +233,7 @@ final class RetainKitTests: XCTestCase {
         XCTAssertFalse(visitor.issues.contains { $0.kind == .storedClosure })
     }
 
-    func testClosureVisitor_closurePassedAsAppendArgumentIsStored() {
+    func testClosureVisitor_closurePassedAsInsertArgumentIsInCollection() {
         let source = """
         class Foo {
             var callbacks: [() -> Void] = []
@@ -244,7 +245,7 @@ final class RetainKitTests: XCTestCase {
         """
         let visitor = ClosureVisitor(filePath: "Foo.swift", source: source)
         visitor.walk(parse(source))
-        XCTAssertEqual(visitor.issues.map(\.kind), [.storedClosure])
+        XCTAssertEqual(visitor.issues.map(\.kind), [.closureInCollection])
     }
 
     func testClosureVisitor_doesNotFlagClosureWithoutSelf() {
@@ -507,20 +508,14 @@ final class RetainKitTests: XCTestCase {
     }
 
     func testEngine_deduplicatesDuplicateIssues() {
-        let source = """
-        class Foo {
-            func bar() {
-                DispatchQueue.main.async {
-                    self.update()
-                }
-            }
-            func update() {}
-        }
-        """
-        let result = DetectionEngine().analyze(filePath: "Foo.swift", source: source)
-        let uniqueLocations = Set(result.issues.map { "\($0.line):\($0.column)" })
-        XCTAssertEqual(result.issues.count, uniqueLocations.count,
-                       "No duplicate issues at same location")
+        let context = SourceContext(filePath: "Foo.swift", source: "class Foo {}\n")
+        let issue = LeakIssue(kind: .escapingClosure, filePath: "Foo.swift",
+                              line: 1, column: 1, message: "m", codeSnippet: "")
+        let other = LeakIssue(kind: .escapingClosure, filePath: "Foo.swift",
+                              line: 2, column: 1, message: "m", codeSnippet: "")
+        let result = DetectionEngine.finalize([issue, other, issue], context: context)
+        XCTAssertEqual(result.map(\.line), [1, 2],
+                       "The same issue reported twice should appear once")
     }
 
     func testEngine_countsCorrectly() {
@@ -542,23 +537,310 @@ final class RetainKitTests: XCTestCase {
             "Count properties must sum to total issues"
         )
     }
-    
-    func testDebug_printAST() {
+
+    // MARK: - Closure escape rules
+
+    private func closureIssues(_ source: String) -> [LeakIssue] {
+        let visitor = ClosureVisitor(filePath: "Foo.swift", source: source)
+        visitor.walk(parse(source))
+        return visitor.issues
+    }
+
+    func testClosureVisitor_skipsNonEscapingCalls() {
         let source = """
         class Foo {
-            var handler: (() -> Void)?
-            func setup() {
-                handler = { self.update() }
+            var items: [Int] = []
+            var x = 1
+            func bar() {
+                items.forEach { print($0 + self.x) }
+                _ = items.filter { $0 > self.x }.sorted { $0 < $1 + self.x }
+                DispatchQueue.main.sync { self.x += 1 }
+            }
+        }
+        """
+        XCTAssertTrue(closureIssues(source).isEmpty,
+                      "Closures passed to non-escaping APIs cannot leak self")
+    }
+
+    func testClosureVisitor_skipsImmediatelyInvokedClosure() {
+        let source = """
+        class Foo {
+            var x = 1
+            lazy var doubled: Int = { self.x * 2 }()
+        }
+        """
+        XCTAssertTrue(closureIssues(source).isEmpty)
+    }
+
+    func testClosureVisitor_unknownCalleeIsHint() {
+        let source = """
+        class Foo {
+            func bar(api: API) {
+                api.fetch { self.update() }
             }
             func update() {}
         }
         """
-        // Print the full AST so we can see the exact node types
-        let tree = parse(source)
-        print(tree.debugDescription)
+        let issues = closureIssues(source)
+        XCTAssertEqual(issues.map(\.kind), [.implicitSelf])
+        XCTAssertEqual(issues.first?.severity, .hint)
+        XCTAssertEqual(issues.first?.detectionTrail[2].label, "Escape not known")
     }
 
-    func testDebug_printDelegateAST() {
+    func testClosureVisitor_knownEscapingKeepsDefaultSeverity() {
+        let source = """
+        class Foo {
+            func bar() {
+                DispatchQueue.main.async { [self] in self.update() }
+                Task { self.update() }
+            }
+            func update() {}
+        }
+        """
+        let issues = closureIssues(source)
+        XCTAssertEqual(issues.map(\.kind), [.escapingClosure, .implicitSelf])
+        XCTAssertEqual(issues.map(\.severity), [.error, .warning])
+        XCTAssertEqual(issues.first?.detectionTrail[2].label, "Escaping API")
+    }
+
+    func testClosureVisitor_nestedEscapingInsideNonEscapingIsFlaggedOnce() {
+        let source = """
+        class Foo {
+            var items: [Int] = []
+            func bar() {
+                items.forEach { _ in
+                    DispatchQueue.main.async { self.update() }
+                }
+            }
+            func update() {}
+        }
+        """
+        let issues = closureIssues(source)
+        XCTAssertEqual(issues.map(\.line), [5])
+    }
+
+    func testKnownEscaping_classifiesNames() {
+        XCTAssertEqual(KnownEscaping.behavior(ofCallee: "async"), .escaping)
+        XCTAssertEqual(KnownEscaping.behavior(ofCallee: "map"), .nonEscaping)
+        XCTAssertEqual(KnownEscaping.behavior(ofCallee: "fetch"), .unknown)
+        XCTAssertTrue(KnownEscaping.escaping.isDisjoint(with: KnownEscaping.nonEscaping))
+    }
+
+    // MARK: - Timer and observer rules
+
+    private func timerIssues(_ source: String) -> [LeakIssue] {
+        let visitor = TimerVisitor(filePath: "Foo.swift", source: source)
+        visitor.walk(parse(source))
+        return visitor.issues
+    }
+
+    func testTimerVisitor_acceptsInvalidateInTeardownMethod() {
+        let source = """
+        class Foo {
+            var timer: Timer?
+            func start() {
+                timer = Timer.scheduledTimer(timeInterval: 1, target: self,
+                    selector: #selector(tick), userInfo: nil, repeats: true)
+            }
+            func viewWillDisappear() { timer?.invalidate() }
+            @objc func tick() {}
+        }
+        """
+        XCTAssertTrue(timerIssues(source).isEmpty,
+                      "A target-based timer can only be invalidated outside deinit")
+    }
+
+    func testTimerVisitor_targetTimerSuggestionDoesNotPointAtDeinit() {
+        let source = """
+        class Foo {
+            func start() {
+                _ = Timer.scheduledTimer(timeInterval: 1, target: self,
+                    selector: #selector(tick), userInfo: nil, repeats: true)
+            }
+            @objc func tick() {}
+        }
+        """
+        let issues = timerIssues(source)
+        XCTAssertEqual(issues.map(\.kind), [.uninvalidatedTimer])
+        XCTAssertTrue(issues[0].suggestion.contains("deinit is never reached"))
+        XCTAssertEqual(issues[0].detectionTrail[2].label, "Target-based timer")
+    }
+
+    func testTimerVisitor_nestedClassTimerIsNotAttributedToOuterClass() {
+        let source = """
+        class Outer {
+            deinit { cache.invalidate() }
+            class Inner {
+                var timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+            }
+        }
+        """
+        let issues = timerIssues(source)
+        XCTAssertEqual(issues.map(\.line), [4],
+                       "Inner's timer is reported once, and Outer's deinit does not mask it")
+    }
+
+    func testTimerVisitor_nestedClassWithOwnCleanupIsNotFlagged() {
+        let source = """
+        class Outer {
+            class Inner {
+                var timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in }
+                deinit { timer.invalidate() }
+            }
+        }
+        """
+        XCTAssertTrue(timerIssues(source).isEmpty)
+    }
+
+    func testTimerVisitor_ignoresKVOAddObserver() {
+        let source = """
+        class Foo {
+            func setup(player: Player) {
+                player.addObserver(self, forKeyPath: "status", options: [], context: nil)
+            }
+        }
+        """
+        XCTAssertTrue(timerIssues(source).isEmpty,
+                      "Only NotificationCenter registrations are covered")
+    }
+
+    func testTimerVisitor_unrelatedRemoveObserverDoesNotSatisfyCheck() {
+        let source = """
+        class Foo {
+            func setup(player: Player) {
+                NotificationCenter.default.addObserver(self,
+                    selector: #selector(handle), name: nil, object: nil)
+            }
+            @objc func handle() {}
+            deinit { player.removeObserver(self, forKeyPath: "status") }
+        }
+        """
+        XCTAssertEqual(timerIssues(source).map(\.kind), [.unremovedObserver])
+    }
+
+    func testTimerVisitor_blockObserverNeedsTokenRemoval() {
+        let flagged = """
+        class Foo {
+            func setup() {
+                _ = NotificationCenter.default.addObserver(forName: nil, object: nil, queue: nil) { _ in }
+            }
+            deinit { NotificationCenter.default.removeObserver(self) }
+        }
+        """
+        let issues = timerIssues(flagged)
+        XCTAssertEqual(issues.map(\.kind), [.unremovedObserver],
+                       "removeObserver(self) does not remove a block-based observer")
+        XCTAssertTrue(issues[0].suggestion.contains("token"))
+
+        let clean = """
+        class Foo {
+            var token: NSObjectProtocol?
+            func setup() {
+                token = NotificationCenter.default.addObserver(forName: nil, object: nil, queue: nil) { _ in }
+            }
+            deinit { if let token { NotificationCenter.default.removeObserver(token) } }
+        }
+        """
+        XCTAssertTrue(timerIssues(clean).isEmpty)
+    }
+
+    // MARK: - Reference graph rules
+
+    private func cycleIssues(_ source: String) -> [LeakIssue] {
+        let graph = ReferenceGraph(filePath: "Foo.swift", source: source)
+        graph.walk(parse(source))
+        graph.detectCycles()
+        return graph.issues
+    }
+
+    func testReferenceGraph_reportsOnlyCycleEdgesDeterministically() {
+        let source = """
+        class A { var b: B? }
+        class B { var c: C? }
+        class C { var b: B? }
+        """
+        for _ in 0..<20 {
+            let issues = cycleIssues(source)
+            XCTAssertEqual(issues.map(\.message), ["Retain cycle: B.c → C.b → B"],
+                           "A leads into the cycle but is not part of it")
+            XCTAssertEqual(issues.map(\.line), [3])
+        }
+    }
+
+    func testReferenceGraph_prefersBackReferenceNameAsBreakPoint() {
+        let source = """
+        class Child { var parent: Parent? }
+        class Parent { var child: Child? }
+        """
+        let issues = cycleIssues(source)
+        XCTAssertEqual(issues.map(\.line), [1])
+        XCTAssertTrue(issues[0].suggestion.contains("Child.parent"))
+        XCTAssertEqual(issues[0].detectionTrail.last?.label, "Break point chosen")
+    }
+
+    func testReferenceGraph_skipsComputedAndStaticProperties() {
+        let source = """
+        class A {
+            var b: B?
+        }
+        class B {
+            var a: A { A() }
+            static var shared: A = A()
+            class var other: A { A() }
+        }
+        """
+        XCTAssertTrue(cycleIssues(source).isEmpty)
+    }
+
+    func testReferenceGraph_observedPropertyIsStillStored() {
+        let source = """
+        class A { var b: B? }
+        class B { var a: A? { didSet {} } }
+        """
+        XCTAssertEqual(cycleIssues(source).count, 1)
+    }
+
+    func testReferenceGraph_unwrapsCollections() {
+        let source = """
+        class A { var children: [B] = [] }
+        class B { var owners: [String: A] = [:] }
+        """
+        XCTAssertEqual(cycleIssues(source).count, 1)
+    }
+
+    // MARK: - Delegate rule
+
+    private func delegateIssues(_ source: String) -> [LeakIssue] {
+        let visitor = PropertyVisitor(filePath: "Foo.swift", source: source)
+        visitor.walk(parse(source))
+        return visitor.issues
+    }
+
+    func testPropertyVisitor_skipsWhenDelegateDeclaredWeak() {
+        let source = """
+        class Child { weak var delegate: Parent? }
+        class Parent {
+            let child = Child()
+            func setup() { child.delegate = self }
+        }
+        """
+        XCTAssertTrue(delegateIssues(source).isEmpty)
+    }
+
+    func testPropertyVisitor_warnsWhenDelegateDeclaredStrong() {
+        let source = """
+        class Child { var delegate: Parent? }
+        class Parent {
+            let child = Child()
+            func setup() { child.delegate = self }
+        }
+        """
+        let issues = delegateIssues(source)
+        XCTAssertEqual(issues.map(\.severity), [.warning])
+        XCTAssertEqual(issues[0].detectionTrail.last?.label, "Declared strong")
+    }
+
+    func testPropertyVisitor_unresolvedDelegateIsHintWithHonestTrail() {
         let source = """
         class Foo {
             func setup(tableView: UITableView) {
@@ -566,7 +848,122 @@ final class RetainKitTests: XCTestCase {
             }
         }
         """
-        let tree = parse(source)
-        print(tree.debugDescription)
+        let issues = delegateIssues(source)
+        XCTAssertEqual(issues.map(\.severity), [.hint])
+        XCTAssertEqual(issues[0].detectionTrail.last?.label, "Declaration not resolved")
+        XCTAssertFalse(issues[0].detectionTrail.contains { $0.label == "Weak check failed" })
+    }
+
+    // MARK: - Suppression
+
+    private let leakingLine = "DispatchQueue.main.async { self.update() }"
+
+    private func engineIssues(body: String) -> [LeakIssue] {
+        let source = """
+        class Foo {
+            func bar() {
+        \(body)
+            }
+            func update() {}
+        }
+        """
+        return DetectionEngine().analyze(filePath: "Foo.swift", source: source).issues
+    }
+
+    func testSuppression_commentOnPreviousLine() {
+        XCTAssertEqual(engineIssues(body: leakingLine).count, 1)
+        XCTAssertTrue(engineIssues(body: "// retainkit:ignore\n\(leakingLine)").isEmpty)
+    }
+
+    func testSuppression_trailingCommentOnSameLine() {
+        XCTAssertTrue(engineIssues(body: "\(leakingLine) // retainkit:ignore").isEmpty)
+    }
+
+    func testSuppression_trailingCommentDoesNotSuppressNextLine() {
+        let body = "let a = 1 // retainkit:ignore\n\(leakingLine)"
+        XCTAssertEqual(engineIssues(body: body).count, 1)
+    }
+
+    func testSuppression_markerInStringLiteralIsIgnored() {
+        let body = "let note = \"retainkit:ignore\"\n\(leakingLine)"
+        XCTAssertEqual(engineIssues(body: body).count, 1)
+    }
+
+    // MARK: - Directory scan
+
+    private func makeTempDirectory() throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("retainkit-tests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url
+    }
+
+    func testAnalyzeDirectory_detectsCycleAcrossFiles() throws {
+        let dir = try makeTempDirectory()
+        try "class A { var b: B? }\n".write(
+            to: dir.appendingPathComponent("A.swift"), atomically: true, encoding: .utf8)
+        try "class B { var a: A? }\n".write(
+            to: dir.appendingPathComponent("B.swift"), atomically: true, encoding: .utf8)
+
+        let results = try DetectionEngine().analyzeDirectory(dir.path)
+        let cycles = results.flatMap(\.issues).filter { $0.kind == .referenceCycle }
+        XCTAssertEqual(cycles.count, 1)
+        XCTAssertEqual(cycles.first?.message, "Retain cycle: A.b → B.a → A")
+        XCTAssertEqual(cycles.first?.codeSnippet, "class B { var a: A? }")
+        XCTAssertTrue(cycles.first?.filePath.hasSuffix("B.swift") ?? false)
+    }
+
+    func testAnalyzeDirectory_skipsUnreadableFileAndContinues() throws {
+        let dir = try makeTempDirectory()
+        try Data([0xFF, 0xFE, 0xFD]).write(to: dir.appendingPathComponent("Bad.swift"))
+        try "class Good {}\n".write(
+            to: dir.appendingPathComponent("Good.swift"), atomically: true, encoding: .utf8)
+
+        var failed: [String] = []
+        let results = try DetectionEngine().analyzeDirectory(dir.path) { path, _ in
+            failed.append(URL(fileURLWithPath: path).lastPathComponent)
+        }
+        XCTAssertEqual(failed, ["Bad.swift"])
+        XCTAssertEqual(results.map { URL(fileURLWithPath: $0.filePath).lastPathComponent },
+                       ["Good.swift"])
+    }
+
+    // MARK: - Scan command
+
+    func testScan_jsonIncludesTrailAndAutoFixFlag() throws {
+        let source = """
+        class Foo {
+            func bar() { DispatchQueue.main.async { self.update() } }
+            func update() {}
+        }
+        """
+        let result = DetectionEngine().analyze(filePath: "Foo.swift", source: source)
+        let json = try Scan.jsonString(results: [result])
+        let parsed = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]])
+        XCTAssertEqual(parsed.count, 1)
+        XCTAssertEqual(parsed[0]["isAutoFixable"] as? Bool, true)
+        XCTAssertEqual((parsed[0]["detectionTrail"] as? [[String: Any]])?.count, 5)
+    }
+
+    func testScan_failOnErrorExitsNonZeroOnlyForErrors() throws {
+        let dir = try makeTempDirectory()
+        let leaky = dir.appendingPathComponent("Leaky.swift")
+        try "class A { var b: B? }\nclass B { var a: A? }\n".write(
+            to: leaky, atomically: true, encoding: .utf8)
+        let clean = dir.appendingPathComponent("Clean.swift")
+        try "class C {}\n".write(to: clean, atomically: true, encoding: .utf8)
+
+        var failing = try Scan.parse([leaky.path, "--json", "--fail-on-error"])
+        XCTAssertThrowsError(try failing.run()) { error in
+            XCTAssertEqual(error as? ExitCode, ExitCode(1))
+        }
+
+        var withoutFlag = try Scan.parse([leaky.path, "--json"])
+        XCTAssertNoThrow(try withoutFlag.run())
+
+        var passing = try Scan.parse([clean.path, "--json", "--fail-on-error"])
+        XCTAssertNoThrow(try passing.run())
     }
 }

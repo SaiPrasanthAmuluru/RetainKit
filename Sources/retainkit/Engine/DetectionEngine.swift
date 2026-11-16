@@ -27,7 +27,16 @@ public struct FileScanResult: Sendable {
 
 /// Orchestrates all visitors over a Swift source file and
 /// returns a deduplicated, severity-sorted list of issues.
+///
+/// ## Suppression
+/// A `// retainkit:ignore` comment silences issues on one line:
+/// - on a line of its own, it applies to the next line
+/// - trailing some code, it applies to that same line
+///
+/// Only real comments count; the text inside a string literal does not.
 public final class DetectionEngine {
+
+    static let suppressionMarker = "retainkit:ignore"
 
     public init() {}
 
@@ -40,64 +49,159 @@ public final class DetectionEngine {
     /// - Returns: All detected issues, sorted by severity then line number.
     public func analyze(filePath: String, source: String) -> FileScanResult {
         let start = Date()
-        let tree = Parser.parse(source: source)
+        let scan = scanFile(filePath: filePath, source: source)
 
-        let closureVisitor  = ClosureVisitor(filePath: filePath, source: source)
-        let timerVisitor    = TimerVisitor(filePath: filePath, source: source)
-        let propertyVisitor = PropertyVisitor(filePath: filePath, source: source)
-        let referenceGraph  = ReferenceGraph(filePath: filePath, source: source)
-
-        closureVisitor.walk(tree)
-        timerVisitor.walk(tree)
-        propertyVisitor.walk(tree)
-        referenceGraph.walk(tree)
-        referenceGraph.detectCycles()
-
-        // Merge and deduplicate
-        var seen = Set<LeakIssue>()
-        let allIssues = (
-            closureVisitor.issues +
-            timerVisitor.issues +
-            propertyVisitor.issues +
-            referenceGraph.issues
-        ).filter { seen.insert($0).inserted }
-
-        // Sort: severity first, then line number
-        let sorted = allIssues.sorted {
-            if $0.severity != $1.severity { return $0.severity < $1.severity }
-            return $0.line < $1.line
-        }
-
-        // Remove lines suppressed with: // retainkit:ignore
-        let sourceLines = source.components(separatedBy: .newlines)
-        let suppressedLines = Set(
-            sourceLines.enumerated().compactMap { index, line -> Int? in
-                // Comment on line N suppresses the issue on line N+1
-                line.trimmingCharacters(in: .whitespaces)
-                    .contains("retainkit:ignore") ? index + 2 : nil
-            }
-        )
-
-        let filtered = sorted.filter { !suppressedLines.contains($0.line) }
+        scan.graph.detectCycles()
 
         return FileScanResult(
             filePath: filePath,
-            issues: filtered,
+            issues: Self.finalize(scan.issues + scan.graph.issues, context: scan.context),
             scanDuration: Date().timeIntervalSince(start)
         )
     }
 
     /// Analyse every Swift file under a directory path.
-    /// - Parameter directoryPath: Root directory to scan.
-    /// - Returns: Results per file, in alphabetical order.
-    public func analyzeDirectory(_ directoryPath: String) throws -> [FileScanResult] {
+    ///
+    /// Reference cycles are detected across the whole directory, so a cycle
+    /// between classes in different files is reported.
+    ///
+    /// A file that cannot be read (missing permissions, not UTF-8) is passed to
+    /// `onFileError` and skipped; the rest of the directory is still scanned.
+    ///
+    /// - Parameters:
+    ///   - directoryPath: Root directory to scan.
+    ///   - onFileError: Called once per unreadable file. Defaults to a line on stderr.
+    /// - Returns: Results per readable file, in alphabetical order.
+    public func analyzeDirectory(
+        _ directoryPath: String,
+        onFileError: (_ filePath: String, _ error: Error) -> Void = DetectionEngine.reportFileError
+    ) throws -> [FileScanResult] {
         let url = URL(fileURLWithPath: directoryPath)
         let files = try swiftFiles(under: url)
 
-        return try files.map { fileURL in
-            let source = try String(contentsOf: fileURL, encoding: .utf8)
-            return analyze(filePath: fileURL.path, source: source)
+        var scans: [(scan: FileScan, start: Date)] = []
+        for fileURL in files {
+            let start = Date()
+            do {
+                let source = try String(contentsOf: fileURL, encoding: .utf8)
+                scans.append((scanFile(filePath: fileURL.path, source: source), start))
+            } catch {
+                onFileError(fileURL.path, error)
+            }
         }
+
+        // One graph for the whole directory: cycles usually cross files.
+        var cycleIssues: [String: [LeakIssue]] = [:]
+        if let combined = scans.first?.scan.graph {
+            for entry in scans.dropFirst() { combined.merge(entry.scan.graph) }
+            combined.detectCycles()
+            cycleIssues = Dictionary(grouping: combined.issues, by: \.filePath)
+        }
+
+        return scans.map { entry in
+            let path = entry.scan.context.filePath
+            return FileScanResult(
+                filePath: path,
+                issues: Self.finalize(
+                    entry.scan.issues + (cycleIssues[path] ?? []),
+                    context: entry.scan.context
+                ),
+                scanDuration: Date().timeIntervalSince(entry.start)
+            )
+        }
+    }
+
+    /// Default `onFileError` handler: one line on stderr.
+    public static func reportFileError(filePath: String, error: Error) {
+        let message = "retainkit: skipped \(filePath): \(error.localizedDescription)\n"
+        FileHandle.standardError.write(Data(message.utf8))
+    }
+
+    // MARK: - Per-file Scan
+
+    /// One file's visitor output, before cycle detection and filtering.
+    struct FileScan {
+        let context: SourceContext
+        /// Issues from the closure, timer and property visitors.
+        let issues: [LeakIssue]
+        /// This file's classes and edges; cycles are not detected yet.
+        let graph: ReferenceGraph
+    }
+
+    /// Parses `source` once and runs every visitor over the same tree.
+    func scanFile(filePath: String, source: String) -> FileScan {
+        let context = SourceContext(filePath: filePath, source: source)
+
+        let closureVisitor  = ClosureVisitor(context: context)
+        let timerVisitor    = TimerVisitor(context: context)
+        let propertyVisitor = PropertyVisitor(context: context)
+        let referenceGraph  = ReferenceGraph(context: context)
+
+        closureVisitor.walk(context.tree)
+        timerVisitor.walk(context.tree)
+        propertyVisitor.walk(context.tree)
+        referenceGraph.walk(context.tree)
+
+        return FileScan(
+            context: context,
+            issues: closureVisitor.issues + timerVisitor.issues + propertyVisitor.issues,
+            graph: referenceGraph
+        )
+    }
+
+    // MARK: - Post-processing
+
+    /// Deduplicates, drops suppressed lines, and sorts by severity then line.
+    static func finalize(_ issues: [LeakIssue], context: SourceContext) -> [LeakIssue] {
+        var seen = Set<LeakIssue>()
+        let suppressed = suppressedLines(in: context)
+
+        return issues
+            .filter { seen.insert($0).inserted }
+            .filter { !suppressed.contains($0.line) }
+            .sorted {
+                if $0.severity != $1.severity { return $0.severity.rank < $1.severity.rank }
+                return $0.line < $1.line
+            }
+    }
+
+    /// Lines silenced by a `// retainkit:ignore` comment.
+    ///
+    /// Comments are read from the syntax tree's trivia, so the marker inside a
+    /// string literal is not a suppression.
+    static func suppressedLines(in context: SourceContext) -> Set<Int> {
+        var lines = Set<Int>()
+
+        func collect(_ trivia: Trivia, startingAt start: AbsolutePosition) {
+            var position = start
+            for piece in trivia {
+                defer { position += piece.sourceLength }
+
+                let text: String
+                switch piece {
+                case .lineComment(let comment), .blockComment(let comment):
+                    text = comment
+                default:
+                    continue
+                }
+                guard text.contains(suppressionMarker) else { continue }
+
+                let line = context.locationConverter.location(for: position).line
+                let lineText = line <= context.sourceLines.count
+                    ? context.sourceLines[line - 1].trimmingCharacters(in: .whitespaces)
+                    : ""
+                // A comment that starts its line applies to the next line;
+                // one that trails code applies to its own.
+                let startsLine = lineText.hasPrefix("//") || lineText.hasPrefix("/*")
+                lines.insert(startsLine ? line + 1 : line)
+            }
+        }
+
+        for token in context.tree.tokens(viewMode: .sourceAccurate) {
+            collect(token.leadingTrivia, startingAt: token.position)
+            collect(token.trailingTrivia, startingAt: token.endPositionBeforeTrailingTrivia)
+        }
+        return lines
     }
 
     // MARK: - Private

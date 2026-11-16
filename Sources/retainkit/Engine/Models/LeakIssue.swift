@@ -10,12 +10,17 @@ import Foundation
 // MARK: - Severity
 
 /// How serious a detected issue is.
+///
+/// `Comparable` orders by reporting priority, most severe first: `.error`
+/// sorts before `.warning`, so `.error < .warning` is true. Use `rank` when
+/// the direction needs to be explicit at the call site.
 public enum IssueSeverity: String, Sendable, Comparable, CaseIterable {
     case hint    = "hint"
     case warning = "warning"
     case error   = "error"
 
-    private var sortOrder: Int {
+    /// Position in a report: 0 is the most severe.
+    public var rank: Int {
         switch self {
         case .error:   return 0
         case .warning: return 1
@@ -24,13 +29,22 @@ public enum IssueSeverity: String, Sendable, Comparable, CaseIterable {
     }
 
     public static func < (lhs: IssueSeverity, rhs: IssueSeverity) -> Bool {
-        lhs.sortOrder < rhs.sortOrder
+        lhs.rank < rhs.rank
     }
 }
 
 // MARK: - Issue Kind
 
 /// The category of memory leak pattern detected.
+///
+/// The three closure kinds differ by where the closure goes and how `self`
+/// is captured:
+/// - `escapingClosure`: `[self]` is in the capture list, without weak/unowned
+/// - `implicitSelf`: the body uses `self` and there is no capture list.
+///   A bare member use such as `update()` is not matched: in a class, Swift
+///   only allows it once `self` is in the capture list, which is the case above
+/// - `storedClosure` / `closureInCollection`: the closure is assigned to a
+///   property, or passed to `append`/`insert`
 public enum IssueKind: String, Sendable, CaseIterable {
     case escapingClosure     = "LC-W001"
     case implicitSelf        = "LC-W002"
@@ -44,7 +58,7 @@ public enum IssueKind: String, Sendable, CaseIterable {
     public var displayName: String {
         switch self {
         case .escapingClosure:     return "Escaping closure captures self strongly"
-        case .implicitSelf:        return "Implicit self capture in closure"
+        case .implicitSelf:        return "Closure uses self without a capture list"
         case .storedClosure:       return "Stored closure captures self"
         case .uninvalidatedTimer:  return "Timer is not invalidated"
         case .unremovedObserver:   return "Observer registered but never removed"
@@ -72,13 +86,13 @@ public enum IssueKind: String, Sendable, CaseIterable {
         case .escapingClosure:
             return "Add [weak self] to the closure capture list"
         case .implicitSelf:
-            return "Add explicit [weak self] capture list"
+            return "Add a [weak self] capture list"
         case .storedClosure:
             return "Use [weak self] in the closure or make the property weak"
         case .uninvalidatedTimer:
-            return "Call timer?.invalidate() in deinit"
+            return "Call invalidate() on the timer in deinit or a teardown method"
         case .unremovedObserver:
-            return "Call removeObserver(self) in deinit"
+            return "Call NotificationCenter removeObserver(self) in deinit or a teardown method"
         case .strongDelegate:
             return "Declare the delegate property as weak"
         case .closureInCollection:

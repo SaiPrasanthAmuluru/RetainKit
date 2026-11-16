@@ -8,22 +8,22 @@
 import SwiftSyntax
 
 /// Visits every closure in a Swift source file and flags
-/// those that capture `self` strongly in an escaping context.
+/// those that capture `self` strongly in a context that can outlive the call.
 final class ClosureVisitor: SyntaxVisitor, SourceLocating {
 
     // MARK: - Output
     private(set) var issues: [LeakIssue] = []
 
     // MARK: - Context
-    private let filePath: String
-    private let sourceLines: [String]
-    let locationConverter: SourceLocationConverter
+    let context: SourceContext
 
-    init(filePath: String, source: String) {
-        self.filePath = filePath
-        self.sourceLines = source.components(separatedBy: .newlines)
-        self.locationConverter = makeLocationConverter(filePath: filePath, source: source)
+    init(context: SourceContext) {
+        self.context = context
         super.init(viewMode: .sourceAccurate)
+    }
+
+    convenience init(filePath: String, source: String) {
+        self.init(context: SourceContext(filePath: filePath, source: source))
     }
 
     // MARK: - Visitor
@@ -35,6 +35,20 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
 
     // MARK: - Detection Logic
 
+    /// Where a closure ends up, which decides whether it can retain `self`.
+    private enum Destination {
+        /// Initializer of a binding or right-hand side of an assignment.
+        case stored
+        /// Argument of `append` / `insert`.
+        case collection
+        /// Passed to an API listed in `KnownEscaping.escaping`.
+        case escapingCall(String)
+        /// Runs before the enclosing expression finishes; cannot leak.
+        case nonEscaping
+        /// Passed to a callee RetainKit knows nothing about, or returned.
+        case unknown(String?)
+    }
+
     private func checkClosure(_ node: ClosureExprSyntax) {
         // 1. Does this closure reference self at all?
         guard closureReferencesSelf(node) else { return }
@@ -42,39 +56,43 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         // 2. Is self captured weakly or unowned?
         if hasSafeCapture(node) { return }
 
-        // 3. Determine the kind — implicit vs explicit vs stored
-        let kind = resolveKind(node)
+        // 3. Can the closure outlive the call it appears in?
+        let destination = resolveDestination(node)
+        if case .nonEscaping = destination { return }
+
+        let kind = resolveKind(node, destination: destination)
         let loc = location(of: node)
-        let snippet = codeLine(at: loc.line)
-        let trail = buildTrail(node: node, kind: kind)
+
+        // An unknown callee may or may not escape: report it, but only as a hint.
+        var severity: IssueSeverity?
+        if case .unknown = destination { severity = .hint }
 
         issues.append(LeakIssue(
             kind: kind,
+            severity: severity,
             filePath: filePath,
             line: loc.line,
             column: loc.column,
             message: kind.displayName,
-            codeSnippet: snippet,
-            detectionTrail: trail,
+            codeSnippet: codeLine(at: loc.line),
+            detectionTrail: buildTrail(node: node, destination: destination),
             isAutoFixable: kind == .escapingClosure || kind == .implicitSelf
         ))
     }
 
     // MARK: - Self Detection
 
-    /// Returns true if the closure body contains any reference to `self`.
+    /// Returns true if the closure captures `self` explicitly or uses it in its body.
     private func closureReferencesSelf(_ node: ClosureExprSyntax) -> Bool {
-        // Check capture list for explicit [self]
-        if let captures = node.signature?.capture?.items {
-            for capture in captures {
-                if let ref = capture.expression.as(DeclReferenceExprSyntax.self),
-                   ref.baseName.text == "self" {
-                    return true
-                }
-            }
+        hasExplicitSelfCapture(node) || bodyContainsSelf(node.statements)
+    }
+
+    /// Returns true if the capture list names `self` (with or without a specifier).
+    private func hasExplicitSelfCapture(_ node: ClosureExprSyntax) -> Bool {
+        guard let captures = node.signature?.capture?.items else { return false }
+        return captures.contains {
+            $0.expression.as(DeclReferenceExprSyntax.self)?.baseName.text == "self"
         }
-        // Check body for implicit self references
-        return bodyContainsSelf(node.statements)
     }
 
     /// Returns true if any statement in the body references `self`.
@@ -90,7 +108,6 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
     /// Returns true if the closure has [weak self] or [unowned self].
     private func hasSafeCapture(_ node: ClosureExprSyntax) -> Bool {
         guard let captures = node.signature?.capture?.items else { return false }
-        // retainkit:ignore — value-type closure, no self capture
         return captures.contains { item in
             let specifier = item.specifier?.specifier.text ?? ""
             let isWeakOrUnowned = specifier == "weak" || specifier == "unowned"
@@ -103,37 +120,30 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
 
     // MARK: - Kind Resolution
 
-    /// Resolves whether this is an escaping, implicit, or stored closure.
-    private func resolveKind(_ node: ClosureExprSyntax) -> IssueKind {
-        // Explicit [self] in capture list without weak/unowned
-        if let captures = node.signature?.capture?.items {
-            for capture in captures {
-                if let ref = capture.expression.as(DeclReferenceExprSyntax.self),
-                   ref.baseName.text == "self" {
-                    if isStoredInProperty(node) { return .storedClosure }
-                    return .escapingClosure
-                }
-            }
+    private func resolveKind(_ node: ClosureExprSyntax, destination: Destination) -> IssueKind {
+        switch destination {
+        case .stored:
+            return .storedClosure
+        case .collection:
+            return .closureInCollection
+        case .escapingCall, .unknown, .nonEscaping:
+            // `[self]` is a deliberate strong capture; no capture list is LC-W002.
+            return hasExplicitSelfCapture(node) ? .escapingClosure : .implicitSelf
         }
-        // No capture list — implicit self
-        if isStoredInProperty(node) { return .storedClosure }
-        return .implicitSelf
     }
 
-    /// Returns true if the closure itself is the value being stored:
-    /// the initializer of a binding, the right-hand side of an assignment,
-    /// or an argument of `append` / `insert`.
-    ///
-    /// Only the closure's immediate context counts. A closure that merely
-    /// sits somewhere inside such an expression (`let names = items.map { ... }`)
-    /// is not stored — its result is.
-    private func isStoredInProperty(_ node: ClosureExprSyntax) -> Bool {
-        guard let parent = node.parent else { return false }
+    // MARK: - Destination Resolution
+
+    /// Classifies the closure by its immediate context only. A closure that
+    /// merely sits somewhere inside a stored expression
+    /// (`let names = items.map { ... }`) is not stored — its result is.
+    private func resolveDestination(_ node: ClosureExprSyntax) -> Destination {
+        guard let parent = node.parent else { return .unknown(nil) }
 
         // var handler: () -> Void = { ... }
         if parent.is(InitializerClauseSyntax.self),
            parent.parent?.is(PatternBindingSyntax.self) == true {
-            return true
+            return .stored
         }
 
         // handler = { ... } is an unfolded SequenceExprSyntax in SwiftSyntax 510:
@@ -144,55 +154,92 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
             if let index = list.firstIndex(where: { $0.id == node.id }),
                index > 0,
                list[index - 1].is(AssignmentExprSyntax.self) {
-                return true
+                return .stored
             }
         }
 
-        // callbacks.append { ... }
-        if let call = parent.as(FunctionCallExprSyntax.self),
-           call.trailingClosure?.id == node.id {
-            return isCollectionInsertion(call)
+        if let call = parent.as(FunctionCallExprSyntax.self) {
+            // { ... }() runs immediately, e.g. `lazy var x: Foo = { ... }()`.
+            if call.calledExpression.id == node.id { return .nonEscaping }
+            // callbacks.append { ... } / queue.async { ... }
+            if call.trailingClosure?.id == node.id { return destination(ofArgumentTo: call) }
+        }
+
+        // foo(bar) { ... } second: { ... }
+        if parent.is(MultipleTrailingClosureElementSyntax.self),
+           let call = parent.parent?.parent?.as(FunctionCallExprSyntax.self) {
+            return destination(ofArgumentTo: call)
         }
 
         // callbacks.append({ ... }) / callbacks.insert({ ... }, at: 0)
         if parent.is(LabeledExprSyntax.self),
            let call = parent.parent?.parent?.as(FunctionCallExprSyntax.self) {
-            return isCollectionInsertion(call)
+            return destination(ofArgumentTo: call)
         }
 
-        return false
+        // Returned, wrapped in a tuple, etc. — not resolvable from syntax.
+        return .unknown(nil)
     }
 
-    private func isCollectionInsertion(_ call: FunctionCallExprSyntax) -> Bool {
-        let name = call.calledExpression
-            .as(MemberAccessExprSyntax.self)?
-            .declName.baseName.text
-        return name == "append" || name == "insert"
+    private func destination(ofArgumentTo call: FunctionCallExprSyntax) -> Destination {
+        guard let name = calleeName(of: call) else { return .unknown(nil) }
+        if name == "append" || name == "insert" { return .collection }
+
+        switch KnownEscaping.behavior(ofCallee: name) {
+        case .escaping:    return .escapingCall(name)
+        case .nonEscaping: return .nonEscaping
+        case .unknown:     return .unknown(name)
+        }
+    }
+
+    /// `queue.async` → "async", `Task` → "Task".
+    private func calleeName(of call: FunctionCallExprSyntax) -> String? {
+        if let member = call.calledExpression.as(MemberAccessExprSyntax.self) {
+            return member.declName.baseName.text
+        }
+        return call.calledExpression.as(DeclReferenceExprSyntax.self)?.baseName.text
     }
 
     // MARK: - Helpers
 
-    private func buildTrail(node: ClosureExprSyntax, kind: IssueKind) -> [TrailStep] {
+    private func buildTrail(node: ClosureExprSyntax, destination: Destination) -> [TrailStep] {
         let loc = location(of: node)
         let hasCaptureList = node.signature?.capture != nil
+
+        let escapeLabel: String
+        let escapeDetail: String
+        switch destination {
+        case .stored:
+            escapeLabel = "Closure is stored"
+            escapeDetail = "Initializer of a binding or right-hand side of an assignment"
+        case .collection:
+            escapeLabel = "Closure is stored"
+            escapeDetail = "Argument of append/insert"
+        case .escapingCall(let name):
+            escapeLabel = "Escaping API"
+            escapeDetail = "`\(name)` is listed in KnownEscaping"
+        case .unknown(let name):
+            escapeLabel = "Escape not known"
+            escapeDetail = name.map { "`\($0)` is not in KnownEscaping; reported as a hint" }
+                ?? "Closure is not a direct call argument; reported as a hint"
+        case .nonEscaping:
+            escapeLabel = "Non-escaping"
+            escapeDetail = "Closure runs before the call returns"
+        }
+
         return [
             TrailStep(step: 1, label: "Parsed file",
                       detail: "SwiftSyntax → AST"),
             TrailStep(step: 2, label: "ClosureVisitor matched",
                       detail: "ClosureExprSyntax at \(loc.line):\(loc.column)"),
-            TrailStep(step: 3,
-                      label: hasCaptureList ? "Escape inferred" : "No capture list",
-                      detail: hasCaptureList ? "Explicit capture without weak/unowned" : "Implicit self capture"),
+            TrailStep(step: 3, label: escapeLabel, detail: escapeDetail),
             TrailStep(step: 4, label: "Capture is strong",
-                      detail: "No [weak] / [unowned] in capture list"),
-            TrailStep(step: 5, label: "self used in body",
-                      detail: "References found in closure body")
+                      detail: hasCaptureList
+                          ? "Capture list has no [weak self] / [unowned self]"
+                          : "No capture list"),
+            TrailStep(step: 5, label: "self used in closure",
+                      detail: "`self` appears in the capture list or body")
         ]
-    }
-
-    private func codeLine(at line: Int) -> String {
-        guard line > 0, line <= sourceLines.count else { return "" }
-        return sourceLines[line - 1].trimmingCharacters(in: .whitespaces)
     }
 }
 
@@ -209,13 +256,6 @@ private final class SelfReferenceFinder: SyntaxVisitor {
 
     override func visit(_ node: DeclReferenceExprSyntax) -> SyntaxVisitorContinueKind {
         if node.baseName.text == "self" { onFound() }
-        return .visitChildren
-    }
-
-    override func visit(_ node: MemberAccessExprSyntax) -> SyntaxVisitorContinueKind {
-        if node.base?.as(DeclReferenceExprSyntax.self)?.baseName.text == "self" {
-            onFound()
-        }
         return .visitChildren
     }
 }

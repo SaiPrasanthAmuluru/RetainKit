@@ -54,7 +54,7 @@ struct Scan: ParsableCommand {
         let allIssues = results.flatMap { $0.issues }
 
         if json {
-            printJSON(results: results)
+            print(try Self.jsonString(results: results))
         } else {
             printHuman(results: results, elapsed: elapsed)
         }
@@ -68,8 +68,7 @@ struct Scan: ParsableCommand {
 
     private func printHuman(results: [FileScanResult], elapsed: TimeInterval) {
         let allIssues  = results.flatMap { $0.issues }
-        let fileCount  = results.filter { !$0.issues.isEmpty }.count
-        let critical   = allIssues.filter { $0.severity == .error   }.count
+        let errors     = allIssues.filter { $0.severity == .error   }.count
         let warnings   = allIssues.filter { $0.severity == .warning  }.count
         let hints      = allIssues.filter { $0.severity == .hint     }.count
         let autoFix    = allIssues.filter { $0.isAutoFixable }.count
@@ -82,7 +81,7 @@ struct Scan: ParsableCommand {
             return
         }
 
-        print("\(critical) critical  ·  \(warnings) warnings  ·  \(hints) hints")
+        print("\(errors) errors  ·  \(warnings) warnings  ·  \(hints) hints")
         if autoFix > 0 { print("✓ \(autoFix) auto-fixable") }
         print("")
 
@@ -99,30 +98,36 @@ struct Scan: ParsableCommand {
         }
     }
 
-    private func printJSON(results: [FileScanResult]) {
-        // Simple JSON output without Codable for now
+    /// Renders every issue as a pretty-printed JSON array.
+    /// Throws if serialization fails, so `--json` never prints nothing and exits 0.
+    static func jsonString(results: [FileScanResult]) throws -> String {
         var output: [[String: Any]] = []
 
         for result in results {
             for issue in result.issues {
                 output.append([
-                    "kind":       issue.kind.rawValue,
-                    "severity":   issue.severity.rawValue,
-                    "file":       issue.filePath,
-                    "line":       issue.line,
-                    "column":     issue.column,
-                    "message":    issue.message,
-                    "suggestion": issue.suggestion
+                    "kind":          issue.kind.rawValue,
+                    "severity":      issue.severity.rawValue,
+                    "file":          issue.filePath,
+                    "line":          issue.line,
+                    "column":        issue.column,
+                    "message":       issue.message,
+                    "suggestion":    issue.suggestion,
+                    "isAutoFixable": issue.isAutoFixable,
+                    "detectionTrail": issue.detectionTrail.map {
+                        ["step": $0.step, "label": $0.label, "detail": $0.detail] as [String: Any]
+                    }
                 ])
             }
         }
 
-        if let data = try? JSONSerialization.data(
+        let data = try JSONSerialization.data(
             withJSONObject: output,
-            options: .prettyPrinted
-        ),
-        let str = String(data: data, encoding: .utf8) {
-            print(str)
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        guard let string = String(data: data, encoding: .utf8) else {
+            throw CocoaError(.fileWriteInapplicableStringEncoding)
         }
+        return string
     }
 }

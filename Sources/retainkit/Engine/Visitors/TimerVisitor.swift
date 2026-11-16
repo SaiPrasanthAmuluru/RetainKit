@@ -6,48 +6,58 @@
 //
 
 import SwiftSyntax
-import SwiftParser
 
 /// Visits class declarations and flags Timer or NotificationCenter
-/// registrations that are never cleaned up in deinit.
+/// registrations that the same class never cleans up.
+///
+/// Each class is judged on its own members: calls inside a nested class
+/// belong to that nested class, not to the one enclosing it.
 final class TimerVisitor: SyntaxVisitor, SourceLocating {
 
     // MARK: - Output
     private(set) var issues: [LeakIssue] = []
 
     // MARK: - Context
-    private let filePath: String
-    private let sourceLines: [String]
-    let locationConverter: SourceLocationConverter
+    let context: SourceContext
 
-    init(filePath: String, source: String) {
-        self.filePath = filePath
-        self.sourceLines = source.components(separatedBy: .newlines)
-        self.locationConverter = makeLocationConverter(filePath: filePath, source: source)
+    init(context: SourceContext) {
+        self.context = context
         super.init(viewMode: .sourceAccurate)
+    }
+
+    convenience init(filePath: String, source: String) {
+        self.init(context: SourceContext(filePath: filePath, source: source))
     }
 
     // MARK: - Visitor
 
     override func visit(_ node: ClassDeclSyntax) -> SyntaxVisitorContinueKind {
         checkClass(node)
+        // Nested classes are visited here and checked separately.
         return .visitChildren
     }
 
     // MARK: - Detection Logic
 
     private func checkClass(_ node: ClassDeclSyntax) {
-        let members = node.memberBlock.members
+        let calls = ownCalls(in: node)
 
-        let timerCalls    = findTimerCalls(in: members)
-        let observerCalls = findObserverCalls(in: members)
-        let deinitBlock   = findDeinit(in: members)
+        checkTimers(calls)
+        checkObservers(calls)
+    }
 
-        // Check timer cleanup
+    private func checkTimers(_ calls: [FunctionCallExprSyntax]) {
+        let timerCalls = calls.filter(isTimerCreation)
+        guard !timerCalls.isEmpty else { return }
+
+        // A target-based timer retains its target, so deinit never runs while
+        // it is scheduled. Any invalidate() in the class counts as cleanup,
+        // wherever it lives.
+        let hasInvalidate = calls.contains { memberName(of: $0) == "invalidate" }
+        guard !hasInvalidate else { return }
+
         for call in timerCalls {
-            let hasCleanup = deinitBlock.map { hasInvalidate(in: $0) } ?? false
-            guard !hasCleanup else { continue }
-
+            let retainsTarget = hasArgument(labeled: "target", in: call)
             let loc = location(of: call)
             issues.append(LeakIssue(
                 kind: .uninvalidatedTimer,
@@ -56,13 +66,27 @@ final class TimerVisitor: SyntaxVisitor, SourceLocating {
                 column: loc.column,
                 message: IssueKind.uninvalidatedTimer.displayName,
                 codeSnippet: codeLine(at: loc.line),
-                detectionTrail: buildTimerTrail(line: loc.line, hasDeinit: deinitBlock != nil)
+                suggestion: retainsTarget
+                    ? "Call invalidate() from a teardown method such as viewWillDisappear or stop(). "
+                      + "The run loop retains the timer's target, so deinit is never reached while it is scheduled"
+                    : nil,
+                detectionTrail: buildTimerTrail(line: loc.line, retainsTarget: retainsTarget)
             ))
         }
+    }
 
-        // Check observer cleanup
-        for call in observerCalls {
-            let hasCleanup = deinitBlock.map { hasRemoveObserver(in: $0) } ?? false
+    private func checkObservers(_ calls: [FunctionCallExprSyntax]) {
+        let removals = calls.filter {
+            memberName(of: $0) == "removeObserver" && isNotificationCenterCall($0)
+        }
+        // removeObserver(self) only removes selector-based registrations.
+        let removesSelf  = removals.contains { firstArgument(of: $0) == "self" }
+        // Block-based registrations are removed by passing the returned token.
+        let removesToken = removals.contains { firstArgument(of: $0) != "self" }
+
+        for call in calls where memberName(of: call) == "addObserver" && isNotificationCenterCall(call) {
+            let isBlockBased = hasArgument(labeled: "forName", in: call)
+            let hasCleanup = isBlockBased ? removesToken : removesSelf
             guard !hasCleanup else { continue }
 
             let loc = location(of: call)
@@ -73,122 +97,113 @@ final class TimerVisitor: SyntaxVisitor, SourceLocating {
                 column: loc.column,
                 message: IssueKind.unremovedObserver.displayName,
                 codeSnippet: codeLine(at: loc.line),
-                detectionTrail: buildObserverTrail(line: loc.line, hasDeinit: deinitBlock != nil)
+                suggestion: isBlockBased
+                    ? "Keep the token returned by addObserver(forName:object:queue:using:) "
+                      + "and pass it to removeObserver(_:)"
+                    : nil,
+                detectionTrail: buildObserverTrail(line: loc.line, isBlockBased: isBlockBased)
             ))
         }
     }
 
-    // MARK: - Finders
+    // MARK: - Matching
 
-    private func findTimerCalls(in members: MemberBlockItemListSyntax) -> [FunctionCallExprSyntax] {
-        var calls: [FunctionCallExprSyntax] = []
-        let finder = FunctionCallFinder(matching: { call in
-            let expr = call.calledExpression.trimmedDescription
-            return expr.contains("Timer.scheduledTimer") ||
-                   expr.contains("Timer.init")
-        }) { call in
-            calls.append(call)
+    /// Every function call in the class body, excluding nested classes.
+    private func ownCalls(in node: ClassDeclSyntax) -> [FunctionCallExprSyntax] {
+        let collector = OwnCallCollector()
+        collector.walk(node.memberBlock)
+        return collector.calls
+    }
+
+    /// `foo.bar()` → "bar". Nil when the callee is not a member access.
+    private func memberName(of call: FunctionCallExprSyntax) -> String? {
+        call.calledExpression.as(MemberAccessExprSyntax.self)?.declName.baseName.text
+    }
+
+    /// `Timer.scheduledTimer(...)`, `Timer(...)` or `Timer.init(...)`.
+    private func isTimerCreation(_ call: FunctionCallExprSyntax) -> Bool {
+        if let reference = call.calledExpression.as(DeclReferenceExprSyntax.self) {
+            return reference.baseName.text == "Timer"
         }
-        finder.walk(Syntax(members))
-        return calls
+        guard let member = call.calledExpression.as(MemberAccessExprSyntax.self),
+              member.base?.trimmedDescription == "Timer" else { return false }
+        let name = member.declName.baseName.text
+        return name == "scheduledTimer" || name == "init"
     }
 
-    private func findObserverCalls(in members: MemberBlockItemListSyntax) -> [FunctionCallExprSyntax] {
-        var calls: [FunctionCallExprSyntax] = []
-        let finder = FunctionCallFinder(matching: { call in
-            let expr = call.calledExpression.trimmedDescription
-            return expr.contains("addObserver") ||
-                   expr.contains("addObserver(forName")
-        }) { call in
-            calls.append(call)
+    /// True when the receiver is spelled as a NotificationCenter, e.g.
+    /// `NotificationCenter.default`. This keeps KVO's `addObserver(_:forKeyPath:)`
+    /// and unrelated `removeObserver` calls out of the rule.
+    private func isNotificationCenterCall(_ call: FunctionCallExprSyntax) -> Bool {
+        guard let base = call.calledExpression.as(MemberAccessExprSyntax.self)?.base else {
+            return false
         }
-        finder.walk(Syntax(members))
-        return calls
+        return base.trimmedDescription.hasPrefix("NotificationCenter")
     }
 
-    private func findDeinit(in members: MemberBlockItemListSyntax) -> DeinitializerDeclSyntax? {
-        for member in members {
-            if let deinit_ = member.decl.as(DeinitializerDeclSyntax.self) {
-                return deinit_
-            }
-        }
-        return nil
+    private func hasArgument(labeled label: String, in call: FunctionCallExprSyntax) -> Bool {
+        call.arguments.contains { $0.label?.text == label }
     }
 
-    private func hasInvalidate(in deinit_: DeinitializerDeclSyntax) -> Bool {
-        var found = false
-        let finder = FunctionCallFinder(matching: { call in
-            call.calledExpression.trimmedDescription.contains("invalidate")
-        }) { _ in found = true }
-        finder.walk(Syntax(deinit_))
-        return found
-    }
-
-    private func hasRemoveObserver(in deinit_: DeinitializerDeclSyntax) -> Bool {
-        var found = false
-        let finder = FunctionCallFinder(matching: { call in
-            call.calledExpression.trimmedDescription.contains("removeObserver")
-        }) { _ in found = true }
-        finder.walk(Syntax(deinit_))
-        return found
+    private func firstArgument(of call: FunctionCallExprSyntax) -> String? {
+        call.arguments.first?.expression.trimmedDescription
     }
 
     // MARK: - Helpers
 
-    private func buildTimerTrail(line: Int, hasDeinit: Bool) -> [TrailStep] {
+    private func buildTimerTrail(line: Int, retainsTarget: Bool) -> [TrailStep] {
         [
             TrailStep(step: 1, label: "Parsed file",
                       detail: "SwiftSyntax → AST"),
             TrailStep(step: 2, label: "TimerVisitor matched",
-                      detail: "Timer.scheduledTimer at line \(line)"),
-            TrailStep(step: 3, label: "Stored in property",
-                      detail: "Timer assigned to instance variable"),
-            TrailStep(step: 4, label: "deinit check",
-                      detail: hasDeinit ? "deinit exists but no invalidate()" : "No deinit block found"),
+                      detail: "Timer created at line \(line)"),
+            TrailStep(step: 3, label: retainsTarget ? "Target-based timer" : "Block-based timer",
+                      detail: retainsTarget
+                          ? "The run loop retains the target until the timer is invalidated"
+                          : "The timer keeps firing until it is invalidated"),
+            TrailStep(step: 4, label: "Cleanup check",
+                      detail: "Searched every method of the class, nested classes excluded"),
             TrailStep(step: 5, label: "No cleanup found",
-                      detail: "timer?.invalidate() missing")
+                      detail: "No invalidate() call in the class")
         ]
     }
 
-    private func buildObserverTrail(line: Int, hasDeinit: Bool) -> [TrailStep] {
+    private func buildObserverTrail(line: Int, isBlockBased: Bool) -> [TrailStep] {
         [
             TrailStep(step: 1, label: "Parsed file",
                       detail: "SwiftSyntax → AST"),
-            TrailStep(step: 2, label: "ObserverVisitor matched",
-                      detail: "addObserver at line \(line)"),
-            TrailStep(step: 3, label: "Registered observer",
-                      detail: "self registered with NotificationCenter"),
-            TrailStep(step: 4, label: "deinit check",
-                      detail: hasDeinit ? "deinit exists but no removeObserver" : "No deinit block found"),
+            TrailStep(step: 2, label: "TimerVisitor matched",
+                      detail: "NotificationCenter addObserver at line \(line)"),
+            TrailStep(step: 3, label: isBlockBased ? "Block-based observer" : "Selector-based observer",
+                      detail: isBlockBased
+                          ? "Registration returns a token that must be removed"
+                          : "self registered with NotificationCenter"),
+            TrailStep(step: 4, label: "Cleanup check",
+                      detail: "Searched every method of the class, nested classes excluded"),
             TrailStep(step: 5, label: "No cleanup found",
-                      detail: "removeObserver(self) missing")
+                      detail: isBlockBased
+                          ? "No NotificationCenter removeObserver(token) call in the class"
+                          : "No NotificationCenter removeObserver(self) call in the class")
         ]
-    }
-
-    private func codeLine(at line: Int) -> String {
-        guard line > 0, line <= sourceLines.count else { return "" }
-        return sourceLines[line - 1].trimmingCharacters(in: .whitespaces)
     }
 }
 
-// MARK: - Function Call Finder
+// MARK: - Own Call Collector
 
-/// Generic visitor that finds function calls matching a predicate.
-private final class FunctionCallFinder: SyntaxVisitor {
-    private let predicate: (FunctionCallExprSyntax) -> Bool
-    private let onMatch: (FunctionCallExprSyntax) -> Void
+/// Collects function calls without descending into nested classes.
+private final class OwnCallCollector: SyntaxVisitor {
+    private(set) var calls: [FunctionCallExprSyntax] = []
 
-    init(
-        matching predicate: @escaping (FunctionCallExprSyntax) -> Bool,
-        onMatch: @escaping (FunctionCallExprSyntax) -> Void
-    ) {
-        self.predicate = predicate
-        self.onMatch = onMatch
+    init() {
         super.init(viewMode: .sourceAccurate)
     }
 
     override func visit(_ node: FunctionCallExprSyntax) -> SyntaxVisitorContinueKind {
-        if predicate(node) { onMatch(node) }
+        calls.append(node)
         return .visitChildren
+    }
+
+    override func visit(_ node: ClassDeclSyntax) -> SyntaxVisitorContinueKind {
+        .skipChildren
     }
 }
