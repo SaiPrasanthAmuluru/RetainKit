@@ -7,6 +7,7 @@
 
 import ArgumentParser
 import Foundation
+import RetainKitCore
 
 /// Scans a Swift file or project directory for memory leaks.
 struct Scan: ParsableCommand {

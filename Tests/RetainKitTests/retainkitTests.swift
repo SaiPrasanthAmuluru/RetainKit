@@ -9,6 +9,7 @@ import XCTest
 import ArgumentParser
 import SwiftParser
 import SwiftSyntax
+@testable import RetainKitCore
 @testable import retainkit
 
 final class RetainKitTests: XCTestCase {

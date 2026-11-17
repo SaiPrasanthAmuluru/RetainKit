@@ -4,6 +4,13 @@ import PackageDescription
 let package = Package(
     name: "retainkit",
     platforms: [.macOS(.v13)],
+    products: [
+        // The detection engine, for embedding in other tools
+        // (an Xcode extension, a macOS app).
+        .library(name: "RetainKitCore", targets: ["RetainKitCore"]),
+        // The command-line scanner.
+        .executable(name: "retainkit", targets: ["retainkit"]),
+    ],
     dependencies: [
         .package(
             url: "https://github.com/apple/swift-syntax.git",
@@ -15,11 +22,18 @@ let package = Package(
         ),
     ],
     targets: [
+        .target(
+            name: "RetainKitCore",
+            dependencies: [
+                .product(name: "SwiftSyntax", package: "swift-syntax"),
+                .product(name: "SwiftParser", package: "swift-syntax"),
+            ],
+            path: "Sources/RetainKitCore"
+        ),
         .executableTarget(
             name: "retainkit",
             dependencies: [
-                .product(name: "SwiftSyntax",    package: "swift-syntax"),
-                .product(name: "SwiftParser",    package: "swift-syntax"),
+                "RetainKitCore",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/retainkit"
@@ -27,6 +41,7 @@ let package = Package(
         .testTarget(
             name: "RetainKitTests",
             dependencies: [
+                "RetainKitCore",
                 "retainkit",
                 .product(name: "SwiftSyntax", package: "swift-syntax"),
                 .product(name: "SwiftParser", package: "swift-syntax"),
