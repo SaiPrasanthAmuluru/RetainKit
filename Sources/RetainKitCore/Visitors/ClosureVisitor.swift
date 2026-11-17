@@ -107,9 +107,25 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
     /// Returns true if the capture list names `self` (with or without a specifier).
     private func hasExplicitSelfCapture(_ node: ClosureExprSyntax) -> Bool {
         guard let captures = node.signature?.capture?.items else { return false }
-        return captures.contains {
-            $0.expression.as(DeclReferenceExprSyntax.self)?.baseName.text == "self"
+        return captures.contains(where: capturesSelf)
+    }
+
+    /// True for `self`, `weak self`, `unowned(unsafe) self` and `name = self`.
+    ///
+    /// Reads the item's tokens instead of its typed children, because the
+    /// shape of `ClosureCaptureSyntax` differs between swift-syntax releases
+    /// (`expression` up to 600, `name` plus `initializer` from 601).
+    private func capturesSelf(_ item: ClosureCaptureSyntax) -> Bool {
+        var skipped = Set<SyntaxIdentifier>()
+        if let specifier = item.specifier {
+            skipped.formUnion(specifier.tokens(viewMode: .sourceAccurate).map(\.id))
         }
+        if let comma = item.trailingComma { skipped.insert(comma.id) }
+
+        let tokens = item.tokens(viewMode: .sourceAccurate)
+            .filter { !skipped.contains($0.id) }
+            .map(\.text)
+        return tokens == ["self"] || tokens.suffix(2) == ["=", "self"]
     }
 
     /// Returns true if any statement in the body references `self`.
@@ -152,10 +168,7 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         return captures.contains { item in
             let specifier = item.specifier?.specifier.text ?? ""
             let isWeakOrUnowned = specifier == "weak" || specifier == "unowned"
-            let capturesSelf = item.expression
-                .as(DeclReferenceExprSyntax.self)?
-                .baseName.text == "self"
-            return isWeakOrUnowned && capturesSelf
+            return isWeakOrUnowned && capturesSelf(item)
         }
     }
 
@@ -226,7 +239,7 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
             return isProperty(binding) ? .stored : .local
         }
 
-        // handler = { ... } is an unfolded SequenceExprSyntax in SwiftSyntax 510:
+        // handler = { ... } is an unfolded SequenceExprSyntax until operators are folded:
         // the closure must be the element right after the `=`.
         if let elements = parent.as(ExprListSyntax.self),
            parent.parent?.is(SequenceExprSyntax.self) == true {

@@ -1316,4 +1316,74 @@ final class RetainKitTests: XCTestCase {
         XCTAssertEqual(cycleIssues(source).map(\.message),
                        ["Retain cycle: Outer.Shared.inner → Outer.Inner.shared → Outer.Shared"])
     }
+
+    // MARK: - Capture list forms
+
+    func testClosureVisitor_capturedSelfUnderAnotherNameIsStrong() {
+        let source = """
+        class Foo {
+            func bar() {
+                DispatchQueue.main.async { [owner = self] in owner.update() }
+            }
+            func update() {}
+        }
+        """
+        XCTAssertEqual(closureIssues(source).map(\.kind), [.escapingClosure])
+    }
+
+    func testClosureVisitor_weakCaptureAmongOtherCaptures() {
+        let source = """
+        class Foo {
+            var delegate: AnyObject?
+            func bar(queue: DispatchQueue) {
+                queue.async { [queue, weak self, weak d = self.delegate] in
+                    self?.update()
+                    _ = (queue, d)
+                }
+                queue.async { [unowned(unsafe) self] in self.update() }
+            }
+            func update() {}
+        }
+        """
+        XCTAssertTrue(closureIssues(source).isEmpty)
+    }
+
+    // MARK: - Newer Swift syntax
+
+    func testEngine_parsesSwift6SyntaxAndStillFindsLeaks() {
+        let source = """
+        enum LoadError: Error { case offline }
+
+        struct Token: ~Copyable {
+            consuming func invalidate() {}
+        }
+
+        final class Loader {
+            nonisolated(unsafe) static var shared: Loader?
+            package var onDone: (() -> Void)?
+
+            func load(_ data: borrowing [UInt8]) throws(LoadError) -> Int {
+                onDone = { self.finish() }
+                return data.count
+            }
+
+            func finish() {}
+        }
+        """
+        let context = SourceContext(filePath: "Loader.swift", source: source)
+        XCTAssertFalse(context.tree.hasError, "Swift 6 syntax should parse cleanly")
+
+        let result = DetectionEngine().analyze(filePath: "Loader.swift", source: source)
+        XCTAssertEqual(result.issues.map(\.kind), [.storedClosure])
+        XCTAssertEqual(result.issues.map(\.line), [12])
+    }
+
+    func testReferenceGraph_valueGenericArgumentAddsNoEdge() {
+        let source = """
+        class A { var slots: InlineArray<3, B>? }
+        class B { var a: A? }
+        """
+        XCTAssertTrue(cycleIssues(source).isEmpty,
+                      "InlineArray is not an unwrapped container, and 3 is not a type")
+    }
 }

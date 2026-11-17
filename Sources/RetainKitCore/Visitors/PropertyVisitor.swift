@@ -50,7 +50,7 @@ final class PropertyVisitor: SyntaxVisitor, SourceLocating {
 
     // MARK: - Visitor
 
-    // `a.delegate = self` is an unfolded SequenceExprSyntax in SwiftSyntax 510.
+    // `a.delegate = self` is an unfolded SequenceExprSyntax until operators are folded.
     override func visit(_ node: SequenceExprSyntax) -> SyntaxVisitorContinueKind {
         checkAssignment(node)
         return .visitChildren
