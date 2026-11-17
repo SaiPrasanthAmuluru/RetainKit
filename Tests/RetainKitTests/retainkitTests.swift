@@ -1241,4 +1241,78 @@ final class RetainKitTests: XCTestCase {
             XCTAssertEqual(cycles.map(\.severity), [.error], property)
         }
     }
+
+    // MARK: - Same-named classes
+
+    private func write(_ files: [String: String], to dir: URL) throws {
+        for (name, source) in files {
+            try source.write(to: dir.appendingPathComponent(name),
+                             atomically: true, encoding: .utf8)
+        }
+    }
+
+    private func directoryCycles(_ files: [String: String]) throws -> [LeakIssue] {
+        let dir = try makeTempDirectory()
+        try write(files, to: dir)
+        return try DetectionEngine().analyzeDirectory(dir.path)
+            .flatMap(\.issues)
+            .filter { $0.kind == .referenceCycle }
+    }
+
+    func testReferenceGraph_sameNamedClassesInDifferentFilesStaySeparate() throws {
+        // Merged by name, one Helper node would carry both edges and report
+        // a short A → Helper → A cycle that does not exist.
+        let cycles = try directoryCycles([
+            "A.swift": "class A { var helper: Helper? }\nprivate class Helper { var b: B? }\n",
+            "B.swift": "class B { var helper: Helper? }\nprivate class Helper { var a: A? }\n",
+        ])
+        XCTAssertEqual(cycles.map(\.message),
+                       ["Retain cycle: A.helper → Helper.b → B.helper → Helper.a → A"],
+                       "Each Helper keeps its own edges and is resolved in its own file")
+    }
+
+    func testReferenceGraph_sameFileDeclarationWinsOverOtherFiles() throws {
+        let cycles = try directoryCycles([
+            "A.swift": "class A { var helper: Helper? }\nprivate class Helper { var a: A? }\n",
+            "B.swift": "private class Helper { var name: String = \"\" }\n",
+        ])
+        XCTAssertEqual(cycles.map(\.message), ["Retain cycle: A.helper → Helper.a → A"])
+    }
+
+    func testReferenceGraph_ambiguousNameAddsNoEdge() throws {
+        let cycles = try directoryCycles([
+            "A.swift": "class A { var model: Model? }\n",
+            "M1.swift": "class Model { var a: A? }\n",
+            "M2.swift": "class Model { var a: A? }\n",
+        ])
+        XCTAssertTrue(cycles.isEmpty,
+                      "A.model could be either Model, so no cycle is claimed")
+    }
+
+    func testReferenceGraph_nestedClassesWithSameNameStaySeparate() {
+        let source = """
+        class A {
+            var item: Item?
+            class Item { var name: String = "" }
+        }
+        class B {
+            var item: Item?
+            class Item { var owner: B? }
+        }
+        """
+        XCTAssertEqual(cycleIssues(source).map(\.message),
+                       ["Retain cycle: B.item → B.Item.owner → B"])
+    }
+
+    func testReferenceGraph_nestedTypeResolvesOutwards() {
+        let source = """
+        class Outer {
+            var shared: Shared?
+            class Shared { var inner: Inner? }
+            class Inner { var shared: Shared? }
+        }
+        """
+        XCTAssertEqual(cycleIssues(source).map(\.message),
+                       ["Retain cycle: Outer.Shared.inner → Outer.Inner.shared → Outer.Shared"])
+    }
 }

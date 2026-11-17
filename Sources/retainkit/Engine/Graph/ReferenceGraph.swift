@@ -9,13 +9,26 @@ import SwiftSyntax
 
 // MARK: - Graph Node
 
+/// Identifies one class declaration. Two classes may share a name
+/// (`private class Helper` in two files, or the same name in two modules),
+/// so the declaring file is part of the identity.
+struct GraphNodeID: Hashable, Comparable {
+    /// Name including enclosing types, e.g. `Outer.Inner`.
+    let name: String
+    let filePath: String
+
+    static func < (lhs: GraphNodeID, rhs: GraphNodeID) -> Bool {
+        (lhs.name, lhs.filePath) < (rhs.name, rhs.filePath)
+    }
+}
+
 /// Represents a class in the reference graph.
 final class GraphNode {
-    let name: String
+    let id: GraphNodeID
     var edges: [GraphEdge] = []
 
-    init(name: String) {
-        self.name = name
+    init(id: GraphNodeID) {
+        self.id = id
     }
 }
 
@@ -23,12 +36,18 @@ final class GraphNode {
 
 /// A directed strong reference from one class to another.
 struct GraphEdge {
-    let from: String
+    /// The declaring class.
+    let fromID: GraphNodeID
+    /// The property's type as written, with containers unwrapped. It is
+    /// resolved to a class when cycles are detected, see `resolve(_:)`.
     let to: String
     let propertyName: String
     let filePath: String
     let line: Int
     let codeSnippet: String
+
+    /// Qualified name of the declaring class.
+    var from: String { fromID.name }
 }
 
 // MARK: - Reference Graph
@@ -49,6 +68,12 @@ struct GraphEdge {
 /// type (`var next: Node?`) is a normal linked list or tree, so it is reported
 /// as a hint, not as a cycle.
 ///
+/// Classes are identified by qualified name and file, so two classes that
+/// share a name stay separate. A property type is resolved like Swift does:
+/// nested types of the declaring class first, then outwards, preferring a
+/// declaration in the same file. A name declared in several other files is
+/// ambiguous and adds no edge.
+///
 /// One graph covers one file. Use `merge(_:)` to combine the graphs of several
 /// files before calling `detectCycles()`, so cycles that span files are found.
 final class ReferenceGraph: SyntaxVisitor, SourceLocating {
@@ -57,7 +82,10 @@ final class ReferenceGraph: SyntaxVisitor, SourceLocating {
     private(set) var issues: [LeakIssue] = []
 
     // MARK: - Graph
-    private var nodes: [String: GraphNode] = [:]
+    private var nodes: [GraphNodeID: GraphNode] = [:]
+
+    /// Declarations by qualified name; rebuilt by `detectCycles()`.
+    private var idsByName: [String: [GraphNodeID]] = [:]
 
     /// Property names that usually point "up" at an owner. These are the
     /// natural place to break a cycle with `weak`.
@@ -86,9 +114,9 @@ final class ReferenceGraph: SyntaxVisitor, SourceLocating {
     // MARK: - Build Phase
 
     override func visit(_ node: ClassDeclSyntax) -> SyntaxVisitorContinueKind {
-        let className = node.name.text
-        let graphNode = nodes[className] ?? GraphNode(name: className)
-        nodes[className] = graphNode
+        let id = GraphNodeID(name: qualifiedName(of: node), filePath: filePath)
+        let graphNode = nodes[id] ?? GraphNode(id: id)
+        nodes[id] = graphNode
 
         for member in node.memberBlock.members {
             guard let varDecl = member.decl.as(VariableDeclSyntax.self) else { continue }
@@ -107,7 +135,7 @@ final class ReferenceGraph: SyntaxVisitor, SourceLocating {
                 let loc = location(of: varDecl)
 
                 graphNode.edges.append(GraphEdge(
-                    from: className,
+                    fromID: id,
                     to: extractTypeName(from: typeAnnotation.type),
                     propertyName: propName,
                     filePath: filePath,
@@ -122,11 +150,11 @@ final class ReferenceGraph: SyntaxVisitor, SourceLocating {
 
     /// Adds another file's classes and edges to this graph.
     func merge(_ other: ReferenceGraph) {
-        for (name, node) in other.nodes {
-            if let existing = nodes[name] {
+        for (id, node) in other.nodes {
+            if let existing = nodes[id] {
                 existing.edges.append(contentsOf: node.edges)
             } else {
-                nodes[name] = node
+                nodes[id] = node
             }
         }
     }
@@ -138,18 +166,42 @@ final class ReferenceGraph: SyntaxVisitor, SourceLocating {
     /// Roots are visited in name order so the same input always reports the
     /// same cycles on the same lines.
     func detectCycles() {
-        var visited = Set<String>()
-        var stack   = Set<String>()
+        idsByName = Dictionary(grouping: nodes.keys.sorted(), by: \.name)
 
-        for nodeName in nodes.keys.sorted() where !visited.contains(nodeName) {
-            dfs(current: nodeName, visited: &visited, stack: &stack, path: [])
+        var visited = Set<GraphNodeID>()
+        var stack   = Set<GraphNodeID>()
+
+        for id in nodes.keys.sorted() where !visited.contains(id) {
+            dfs(current: id, visited: &visited, stack: &stack, path: [])
+        }
+    }
+
+    /// Finds the class an edge points at, or nil when it is not a scanned
+    /// class or the name is ambiguous.
+    ///
+    /// For a property of `Outer.Inner` typed `Item`, the candidates are
+    /// `Outer.Inner.Item`, `Outer.Item`, then `Item`. The first name that is
+    /// declared anywhere wins; among several declarations of it, the one in
+    /// the edge's own file is used.
+    private func resolve(_ edge: GraphEdge) -> GraphNodeID? {
+        var scope = edge.from.split(separator: ".").map(String.init)
+        while true {
+            let candidate = (scope + [edge.to]).joined(separator: ".")
+            if let ids = idsByName[candidate] {
+                if let sameFile = ids.first(where: { $0.filePath == edge.filePath }) {
+                    return sameFile
+                }
+                return ids.count == 1 ? ids[0] : nil
+            }
+            if scope.isEmpty { return nil }
+            scope.removeLast()
         }
     }
 
     private func dfs(
-        current: String,
-        visited: inout Set<String>,
-        stack: inout Set<String>,
+        current: GraphNodeID,
+        visited: inout Set<GraphNodeID>,
+        stack: inout Set<GraphNodeID>,
         path: [GraphEdge]
     ) {
         visited.insert(current)
@@ -160,31 +212,32 @@ final class ReferenceGraph: SyntaxVisitor, SourceLocating {
         guard let node = nodes[current] else { return }
 
         for edge in node.edges {
-            guard nodes[edge.to] != nil else { continue }
+            guard let target = resolve(edge) else { continue }
 
             // A type that refers to itself is not a cycle between instances.
-            if edge.to == current {
+            if target == current {
                 reportSelfReference(edge)
                 continue
             }
 
-            if !visited.contains(edge.to) {
+            if !visited.contains(target) {
                 dfs(
-                    current: edge.to,
+                    current: target,
                     visited: &visited,
                     stack: &stack,
                     path: path + [edge]
                 )
-            } else if stack.contains(edge.to) {
-                reportCycle(path: path + [edge], closingNode: edge.to)
+            } else if stack.contains(target) {
+                reportCycle(path: path + [edge], closingNode: target)
             }
         }
     }
 
-    private func reportCycle(path: [GraphEdge], closingNode: String) {
+    private func reportCycle(path: [GraphEdge], closingNode closingID: GraphNodeID) {
+        let closingNode = closingID.name
         // `path` starts at the DFS root. Keep only the edges from the closing
         // node onwards: the ones before it lead into the cycle but aren't part of it.
-        let cycle = Array(path.drop { $0.from != closingNode })
+        let cycle = Array(path.drop { $0.fromID != closingID })
         guard let lastEdge = cycle.last else { return }
 
         let keywordEdge = cycle.first(where: isBackReference)
@@ -240,6 +293,27 @@ final class ReferenceGraph: SyntaxVisitor, SourceLocating {
     }
 
     // MARK: - Helpers
+
+    /// `Inner` declared inside `Outer` (or `extension Outer`) is `Outer.Inner`.
+    private func qualifiedName(of node: ClassDeclSyntax) -> String {
+        var parts = [node.name.text]
+        var ancestor = node.parent
+        while let current = ancestor {
+            if let decl = current.as(ClassDeclSyntax.self) {
+                parts.append(decl.name.text)
+            } else if let decl = current.as(StructDeclSyntax.self) {
+                parts.append(decl.name.text)
+            } else if let decl = current.as(EnumDeclSyntax.self) {
+                parts.append(decl.name.text)
+            } else if let decl = current.as(ActorDeclSyntax.self) {
+                parts.append(decl.name.text)
+            } else if let decl = current.as(ExtensionDeclSyntax.self) {
+                parts.append(decl.extendedType.trimmedDescription)
+            }
+            ancestor = current.parent
+        }
+        return parts.reversed().joined(separator: ".")
+    }
 
     /// A binding with a getter (`var x: Foo { ... }` or `get`/`set` accessors)
     /// stores nothing. `willSet`/`didSet` observers leave it a stored property.
