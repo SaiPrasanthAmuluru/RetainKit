@@ -27,6 +27,32 @@ struct Scan: ParsableCommand {
     @Flag(name: .long, help: "Exit with code 1 if any errors are found.")
     var failOnError: Bool = false
 
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "Skip files and directories matching this pattern. Repeat for several.",
+            discussion: """
+                A pattern without "/" matches a file or directory name at any depth \
+                (Tests, *.generated.swift). A pattern with "/" is matched against the \
+                path relative to the scanned directory (Sources/Legacy).
+                """,
+            valueName: "pattern"
+        )
+    )
+    var exclude: [String] = []
+
+    @Option(
+        name: .long,
+        help: ArgumentHelp(
+            "Path to a configuration file. Defaults to .retainkit.json in the scanned directory.",
+            valueName: "file"
+        )
+    )
+    var config: String?
+
+    @Flag(name: .long, help: "Also scan Pods, Carthage and DerivedData.")
+    var noDefaultExcludes: Bool = false
+
     // MARK: - Run
 
     mutating func run() throws {
@@ -45,7 +71,7 @@ struct Scan: ParsableCommand {
         let results: [FileScanResult]
 
         if isDirectory.boolValue {
-            results = try engine.analyzeDirectory(path)
+            results = try engine.analyzeDirectory(path, excluding: try excludePatterns(for: url))
         } else {
             let source = try String(contentsOf: url, encoding: .utf8)
             results = [engine.analyze(filePath: path, source: source)]
@@ -63,6 +89,26 @@ struct Scan: ParsableCommand {
         if failOnError && allIssues.contains(where: { $0.severity == .error }) {
             throw ExitCode(1)
         }
+    }
+
+    // MARK: - Configuration
+
+    /// Combines the built-in excludes, the configuration file and `--exclude`.
+    func excludePatterns(for directory: URL) throws -> [String] {
+        let configuration: ScanConfiguration?
+        do {
+            if let config {
+                configuration = try ScanConfiguration.load(from: URL(fileURLWithPath: config))
+            } else {
+                configuration = try ScanConfiguration.loadIfPresent(in: directory)
+            }
+        } catch {
+            throw ValidationError(error.localizedDescription)
+        }
+
+        return (noDefaultExcludes ? [] : ScanConfiguration.defaultExcludes)
+            + (configuration?.exclude ?? [])
+            + exclude
     }
 
     // MARK: - Output

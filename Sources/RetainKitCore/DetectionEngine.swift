@@ -70,14 +70,18 @@ public final class DetectionEngine {
     ///
     /// - Parameters:
     ///   - directoryPath: Root directory to scan.
+    ///   - excluding: Patterns for files and directories to skip, relative to
+    ///     `directoryPath`. See `ExcludeMatcher` for the syntax. Defaults to
+    ///     `ScanConfiguration.defaultExcludes`; pass `[]` to scan everything.
     ///   - onFileError: Called once per unreadable file. Defaults to a line on stderr.
     /// - Returns: Results per readable file, in alphabetical order.
     public func analyzeDirectory(
         _ directoryPath: String,
+        excluding excludePatterns: [String] = ScanConfiguration.defaultExcludes,
         onFileError: (_ filePath: String, _ error: Error) -> Void = DetectionEngine.reportFileError
     ) throws -> [FileScanResult] {
         let url = URL(fileURLWithPath: directoryPath)
-        let files = try swiftFiles(under: url)
+        let files = try swiftFiles(under: url, excluding: ExcludeMatcher(patterns: excludePatterns))
 
         var scans: [(scan: FileScan, start: Date)] = []
         for fileURL in files {
@@ -206,16 +210,29 @@ public final class DetectionEngine {
 
     // MARK: - Private
 
-    private func swiftFiles(under url: URL) throws -> [URL] {
+    private func swiftFiles(under root: URL, excluding matcher: ExcludeMatcher) throws -> [URL] {
+        // Relative URLs give the path below the scan root directly. Comparing
+        // absolute paths instead breaks when the root goes through a symlink
+        // (/var → /private/var), because the enumerator resolves it.
         guard let enumerator = FileManager.default.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.isRegularFileKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            at: root,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants, .producesRelativePathURLs]
         ) else { return [] }
 
-        return enumerator
-            .compactMap { $0 as? URL }
-            .filter { $0.pathExtension == "swift" }
-            .sorted { $0.path < $1.path }
+        var files: [URL] = []
+
+        for case let url as URL in enumerator {
+            if matcher.excludes(url.relativePath) {
+                // Don't walk into an excluded directory at all.
+                enumerator.skipDescendants()
+                continue
+            }
+            if url.pathExtension == "swift",
+               (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) != true {
+                files.append(root.appendingPathComponent(url.relativePath))
+            }
+        }
+        return files.sorted { $0.path < $1.path }
     }
 }
