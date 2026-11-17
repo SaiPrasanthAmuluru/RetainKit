@@ -41,7 +41,7 @@ The binary is at `.build/release/retainkit`. Copy it somewhere on your `PATH`, o
 ## Usage
 
 ```bash
-retainkit scan <path> [--json] [--fail-on-error]
+retainkit scan <path> [--json] [--fail-on-error] [--exclude <pattern> ...] [--config <file>]
 ```
 
 | Argument | Meaning |
@@ -49,6 +49,9 @@ retainkit scan <path> [--json] [--fail-on-error]
 | `<path>` | A Swift file, or a directory to scan recursively. |
 | `--json` | Print the issues as a JSON array instead of text. |
 | `--fail-on-error` | Exit with code 1 if any issue has severity `error`. |
+| `--exclude <pattern>` | Skip matching files and directories. Repeat for several. |
+| `--config <file>` | Read options from this file instead of `.retainkit.json`. |
+| `--no-default-excludes` | Also scan `Pods`, `Carthage` and `DerivedData`. |
 
 Without `--fail-on-error` the exit code is 0 whatever is found. Warnings and hints never change the exit code.
 
@@ -59,6 +62,39 @@ A file that cannot be read is reported on stderr and skipped; the rest of the di
 ```bash
 retainkit scan Sources --fail-on-error
 ```
+
+## Excluding files
+
+A directory scan skips hidden directories (such as `.build`) and, by default, `Pods`, `Carthage` and `DerivedData`. Add your own patterns with `--exclude`:
+
+```bash
+retainkit scan . --exclude Tests --exclude "*.generated.swift" --exclude Sources/Legacy
+```
+
+| Pattern | Skips |
+|---|---|
+| `Tests` | Any file or directory named `Tests`, at any depth |
+| `*.generated.swift` | Any file whose name matches, at any depth |
+| `Sources/Legacy` | That directory, relative to the scanned directory |
+| `Sources/*/Mocks` | `Mocks` inside any directory under `Sources` |
+
+A pattern without `/` is matched against each file and directory name. A pattern with `/` is matched against the path relative to the scanned directory. `*`, `?` and `[abc]` are wildcards.
+
+Excluded files are not read at all, so they take no part in cycle detection either.
+
+Excludes apply to directory scans. A file passed directly, as in `retainkit scan Sources/Foo.swift`, is always scanned.
+
+### Configuration file
+
+To keep the patterns with the project, put a `.retainkit.json` in the directory you scan:
+
+```json
+{
+  "exclude": ["Tests", "*.generated.swift", "Sources/Legacy"]
+}
+```
+
+Patterns from the file and from `--exclude` are combined. `--config <file>` reads a different file. A `.retainkit.json` that is not valid, or a `--config` file that is missing or not valid, stops the scan with an error. This holds for a single-file scan too, although only `--config` is read there.
 
 ## Rules
 

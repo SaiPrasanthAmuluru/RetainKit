@@ -1386,4 +1386,161 @@ final class RetainKitTests: XCTestCase {
         XCTAssertTrue(cycleIssues(source).isEmpty,
                       "InlineArray is not an unwrapped container, and 3 is not a type")
     }
+
+    // MARK: - Exclude patterns
+
+    func testExcludeMatcher_nameMatchesAtAnyDepth() {
+        let matcher = ExcludeMatcher(patterns: ["Tests", "*.generated.swift"])
+        XCTAssertTrue(matcher.excludes("Tests"))
+        XCTAssertTrue(matcher.excludes("App/Tests/FooTests.swift"))
+        XCTAssertTrue(matcher.excludes("App/Models/User.generated.swift"))
+        XCTAssertFalse(matcher.excludes("App/TestSupport/Foo.swift"),
+                       "A name pattern matches whole components, not prefixes")
+        XCTAssertFalse(matcher.excludes("App/Models/User.swift"))
+    }
+
+    func testExcludeMatcher_pathPatternIsAnchoredAtRoot() {
+        let matcher = ExcludeMatcher(patterns: ["Sources/Legacy", "Sources/*/Mocks"])
+        XCTAssertTrue(matcher.excludes("Sources/Legacy"))
+        XCTAssertTrue(matcher.excludes("Sources/Legacy/Old.swift"))
+        XCTAssertTrue(matcher.excludes("Sources/App/Mocks/MockAPI.swift"))
+        XCTAssertFalse(matcher.excludes("Other/Sources/Legacy/Old.swift"))
+        XCTAssertFalse(matcher.excludes("Sources/LegacyKit/New.swift"))
+    }
+
+    func testExcludeMatcher_normalisesPatterns() {
+        let matcher = ExcludeMatcher(patterns: ["./Pods/", "  ", ""])
+        XCTAssertTrue(matcher.excludes("Pods/Alamofire/Session.swift"))
+        XCTAssertFalse(matcher.excludes("App/Session.swift"))
+        XCTAssertTrue(ExcludeMatcher(patterns: ["", " "]).isEmpty)
+    }
+
+    private func scannedFiles(in dir: URL, excluding patterns: [String]? = nil) throws -> [String] {
+        let engine = DetectionEngine()
+        let results = try patterns.map { try engine.analyzeDirectory(dir.path, excluding: $0) }
+            ?? engine.analyzeDirectory(dir.path)
+        let prefix = dir.path + "/"
+        return results.map { String($0.filePath.dropFirst(prefix.count)) }
+    }
+
+    private func makeProject() throws -> URL {
+        let dir = try makeTempDirectory()
+        let files = [
+            "App/Main.swift", "App/Legacy/Old.swift", "App/Models/User.generated.swift",
+            "Tests/MainTests.swift", "Pods/Lib/Lib.swift",
+        ]
+        for file in files {
+            let url = dir.appendingPathComponent(file)
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try "class C {}\n".write(to: url, atomically: true, encoding: .utf8)
+        }
+        return dir
+    }
+
+    func testAnalyzeDirectory_skipsDefaultExcludes() throws {
+        let dir = try makeProject()
+        XCTAssertEqual(try scannedFiles(in: dir), [
+            "App/Legacy/Old.swift", "App/Main.swift",
+            "App/Models/User.generated.swift", "Tests/MainTests.swift",
+        ])
+        XCTAssertTrue(try scannedFiles(in: dir, excluding: []).contains("Pods/Lib/Lib.swift"),
+                      "An empty list scans everything")
+    }
+
+    func testAnalyzeDirectory_appliesExcludePatterns() throws {
+        let dir = try makeProject()
+        let files = try scannedFiles(
+            in: dir, excluding: ["Pods", "Tests", "App/Legacy", "*.generated.swift"])
+        XCTAssertEqual(files, ["App/Main.swift"])
+    }
+
+    func testAnalyzeDirectory_excludedFilesTakeNoPartInCycles() throws {
+        let dir = try makeTempDirectory()
+        try write(["A.swift": "class A { var b: B? }\n"], to: dir)
+        try FileManager.default.createDirectory(
+            at: dir.appendingPathComponent("Generated"), withIntermediateDirectories: true)
+        try write(["Generated/B.swift": "class B { var a: A? }\n"], to: dir)
+
+        let all = try DetectionEngine().analyzeDirectory(dir.path).flatMap(\.issues)
+        XCTAssertEqual(all.count, 1)
+        let filtered = try DetectionEngine()
+            .analyzeDirectory(dir.path, excluding: ["Generated"]).flatMap(\.issues)
+        XCTAssertTrue(filtered.isEmpty)
+    }
+
+    // MARK: - Configuration file
+
+    func testScanConfiguration_loadsExcludesAndIgnoresUnknownKeys() throws {
+        let dir = try makeTempDirectory()
+        try write([".retainkit.json": #"{"exclude": ["Tests"], "futureOption": true}"#], to: dir)
+        XCTAssertEqual(try ScanConfiguration.loadIfPresent(in: dir),
+                       ScanConfiguration(exclude: ["Tests"]))
+    }
+
+    func testScanConfiguration_missingFileIsNilAndEmptyObjectIsDefault() throws {
+        let dir = try makeTempDirectory()
+        XCTAssertNil(try ScanConfiguration.loadIfPresent(in: dir))
+        try write([".retainkit.json": "{}"], to: dir)
+        XCTAssertEqual(try ScanConfiguration.loadIfPresent(in: dir), ScanConfiguration())
+    }
+
+    func testScanConfiguration_invalidFileThrowsDescriptiveError() throws {
+        let dir = try makeTempDirectory()
+        try write([".retainkit.json": #"{"exclude": "Tests"}"#], to: dir)
+        XCTAssertThrowsError(try ScanConfiguration.loadIfPresent(in: dir)) { error in
+            guard case ScanConfigurationError.invalid(let path, _) = error else {
+                return XCTFail("Expected .invalid, got \(error)")
+            }
+            XCTAssertTrue(path.hasSuffix(".retainkit.json"))
+            XCTAssertTrue(error.localizedDescription.hasPrefix("Invalid configuration"))
+        }
+    }
+
+    func testScan_combinesDefaultsConfigFileAndFlags() throws {
+        let dir = try makeProject()
+        try write([".retainkit.json": #"{"exclude": ["App/Legacy"]}"#], to: dir)
+
+        let command = try Scan.parse([dir.path, "--exclude", "Tests", "--exclude", "*.generated.swift"])
+        XCTAssertEqual(try command.excludePatterns(for: dir),
+                       ["Pods", "Carthage", "DerivedData", "App/Legacy", "Tests", "*.generated.swift"])
+
+        let noDefaults = try Scan.parse([dir.path, "--no-default-excludes"])
+        XCTAssertEqual(try noDefaults.excludePatterns(for: dir), ["App/Legacy"])
+    }
+
+    func testScan_explicitConfigReplacesDirectoryConfig() throws {
+        let dir = try makeProject()
+        try write([".retainkit.json": #"{"exclude": ["App/Legacy"]}"#], to: dir)
+        let other = try makeTempDirectory()
+        try write(["custom.json": #"{"exclude": ["Tests"]}"#], to: other)
+
+        let command = try Scan.parse(
+            [dir.path, "--no-default-excludes", "--config", other.appendingPathComponent("custom.json").path])
+        XCTAssertEqual(try command.excludePatterns(for: dir), ["Tests"])
+    }
+
+    func testScan_invalidOrMissingConfigFailsTheRun() throws {
+        let dir = try makeProject()
+        var missing = try Scan.parse([dir.path, "--json", "--config", dir.appendingPathComponent("nope.json").path])
+        XCTAssertThrowsError(try missing.run())
+
+        try write([".retainkit.json": "not json"], to: dir)
+        var invalid = try Scan.parse([dir.path, "--json"])
+        XCTAssertThrowsError(try invalid.run())
+    }
+
+    func testScan_singleFileIgnoresExcludesButValidatesExplicitConfig() throws {
+        let dir = try makeProject()
+        try write([".retainkit.json": "not json"], to: dir.appendingPathComponent("Tests"))
+        let file = dir.appendingPathComponent("Tests/MainTests.swift").path
+
+        // Excluded by pattern and beside an invalid .retainkit.json: still scanned.
+        var excluded = try Scan.parse([file, "--json", "--exclude", "Tests"])
+        XCTAssertNoThrow(try excluded.run())
+
+        var badConfig = try Scan.parse(
+            [file, "--json", "--config", dir.appendingPathComponent("nope.json").path])
+        XCTAssertThrowsError(try badConfig.run(), "An explicit --config is always validated")
+    }
 }
