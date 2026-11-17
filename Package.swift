@@ -47,7 +47,9 @@ let package = Package(
                 .product(name: "SwiftParser", package: "swift-syntax"),
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
-            path: "Tests/RetainKitTests"
+            path: "Tests/RetainKitTests",
+            // Xcode test plan, not a source file or resource.
+            exclude: ["retainkit.xctestplan"]
         ),
     ]
 )

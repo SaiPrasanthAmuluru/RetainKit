@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch or PR replaces the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Runner images and Xcode versions are pinned so a new image can't
+        # change the toolchain unannounced. Bump them deliberately; the
+        # "Swift version" step prints what ran.
+        include:
+          # Oldest toolchain GitHub still hosts. This is the minimum the
+          # README promises, so keep the two in step.
+          - name: Swift 6.0
+            os: macos-15
+            xcode: "16.1"
+          # Current toolchain.
+          - name: Swift 6.3
+            os: macos-26
+            xcode: "26.6"
+    runs-on: ${{ matrix.os }}
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_${{ matrix.xcode }}.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v5
+      - name: Swift version
+        run: swift --version
+      - name: Build
+        run: swift build
+      - name: Test
+        run: swift test

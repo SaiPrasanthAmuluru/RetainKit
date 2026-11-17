@@ -2,7 +2,6 @@
 .swiftpm/
 *.o
 *.d
-Package.resolved
 DerivedData/
 *.xcodeproj
 .DS_Store
