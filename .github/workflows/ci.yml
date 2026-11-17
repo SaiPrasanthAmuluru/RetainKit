@@ -16,7 +16,9 @@ permissions:
 jobs:
   test:
     name: Build and test
-    runs-on: macos-latest
+    # Pinned so a new runner image can't change the toolchain unannounced.
+    # Bump deliberately; the "Swift version" step prints what ran.
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v5
       - name: Swift version
