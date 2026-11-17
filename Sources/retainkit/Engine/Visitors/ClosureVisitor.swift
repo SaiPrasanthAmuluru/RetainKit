@@ -17,8 +17,15 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
     // MARK: - Context
     let context: SourceContext
 
+    /// Names of the structs and enums declared in this file, used to
+    /// recognise `extension Point { ... }` as an extension of a value type.
+    private let valueTypeNames: Set<String>
+
     init(context: SourceContext) {
         self.context = context
+        let collector = ValueTypeNameCollector()
+        collector.walk(context.tree)
+        self.valueTypeNames = collector.names
         super.init(viewMode: .sourceAccurate)
     }
 
@@ -37,8 +44,11 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
 
     /// Where a closure ends up, which decides whether it can retain `self`.
     private enum Destination {
-        /// Initializer of a binding or right-hand side of an assignment.
+        /// Initializer of a property or right-hand side of an assignment.
         case stored
+        /// Initializer of a local `let`/`var`. It leaks only if that variable
+        /// is itself stored or passed somewhere that outlives the function.
+        case local
         /// Argument of `append` / `insert`.
         case collection
         /// Passed to an API listed in `KnownEscaping.escaping`.
@@ -53,6 +63,9 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         // 1. Does this closure reference self at all?
         guard closureReferencesSelf(node) else { return }
 
+        // A struct or enum `self` is copied into the closure, not retained.
+        if isInsideValueType(node) { return }
+
         // 2. Is self captured weakly or unowned, here or in an enclosing closure?
         if hasSafeCapture(node) || usesWeakSelfOfEnclosingClosure(node) { return }
 
@@ -63,9 +76,13 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         let kind = resolveKind(node, destination: destination)
         let loc = location(of: node)
 
-        // An unknown callee may or may not escape: report it, but only as a hint.
+        // An unknown callee or a local variable may or may not escape:
+        // report it, but only as a hint.
         var severity: IssueSeverity?
-        if case .unknown = destination { severity = .hint }
+        switch destination {
+        case .unknown, .local: severity = .hint
+        default: break
+        }
 
         issues.append(LeakIssue(
             kind: kind,
@@ -101,6 +118,30 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         let finder = SelfReferenceFinder { found = true }
         finder.walk(Syntax(statements))
         return found
+    }
+
+    // MARK: - Enclosing Type
+
+    /// Returns true if the nearest enclosing type is a struct or enum, so
+    /// `self` is a value. An extension counts when it extends a struct or enum
+    /// declared in the same file; an extension of any other type is not
+    /// resolvable from syntax and is treated as a possible class.
+    private func isInsideValueType(_ node: ClosureExprSyntax) -> Bool {
+        var ancestor = node.parent
+        while let current = ancestor {
+            if current.is(StructDeclSyntax.self) || current.is(EnumDeclSyntax.self) {
+                return true
+            }
+            if current.is(ClassDeclSyntax.self) || current.is(ActorDeclSyntax.self)
+                || current.is(ProtocolDeclSyntax.self) {
+                return false
+            }
+            if let ext = current.as(ExtensionDeclSyntax.self) {
+                return valueTypeNames.contains(ext.extendedType.trimmedDescription)
+            }
+            ancestor = current.parent
+        }
+        return false
     }
 
     // MARK: - Capture Safety
@@ -165,7 +206,7 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
             return .storedClosure
         case .collection:
             return .closureInCollection
-        case .escapingCall, .unknown, .nonEscaping:
+        case .escapingCall, .unknown, .local, .nonEscaping:
             // `[self]` is a deliberate strong capture; no capture list is LC-W002.
             return hasExplicitSelfCapture(node) ? .escapingClosure : .implicitSelf
         }
@@ -181,8 +222,8 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
 
         // var handler: () -> Void = { ... }
         if parent.is(InitializerClauseSyntax.self),
-           parent.parent?.is(PatternBindingSyntax.self) == true {
-            return .stored
+           let binding = parent.parent?.as(PatternBindingSyntax.self) {
+            return isProperty(binding) ? .stored : .local
         }
 
         // handler = { ... } is an unfolded SequenceExprSyntax in SwiftSyntax 510:
@@ -220,6 +261,12 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         return .unknown(nil)
     }
 
+    /// True when the binding is a member of a type, not a local variable.
+    /// PatternBinding → PatternBindingList → VariableDecl → MemberBlockItem.
+    private func isProperty(_ binding: PatternBindingSyntax) -> Bool {
+        binding.parent?.parent?.parent?.is(MemberBlockItemSyntax.self) == true
+    }
+
     private func destination(ofArgumentTo call: FunctionCallExprSyntax) -> Destination {
         guard let name = calleeName(of: call) else { return .unknown(nil) }
         if name == "append" || name == "insert" { return .collection }
@@ -250,7 +297,10 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         switch destination {
         case .stored:
             escapeLabel = "Closure is stored"
-            escapeDetail = "Initializer of a binding or right-hand side of an assignment"
+            escapeDetail = "Initializer of a property or right-hand side of an assignment"
+        case .local:
+            escapeLabel = "Escape not known"
+            escapeDetail = "Assigned to a local variable; reported as a hint"
         case .collection:
             escapeLabel = "Closure is stored"
             escapeDetail = "Argument of append/insert"
@@ -279,6 +329,27 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
             TrailStep(step: 5, label: "self used in closure",
                       detail: "`self` appears in the capture list or body")
         ]
+    }
+}
+
+// MARK: - Value Type Name Collector
+
+/// Collects the names of every struct and enum declared in a file.
+private final class ValueTypeNameCollector: SyntaxVisitor {
+    private(set) var names: Set<String> = []
+
+    init() {
+        super.init(viewMode: .sourceAccurate)
+    }
+
+    override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
+        names.insert(node.name.text)
+        return .visitChildren
+    }
+
+    override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind {
+        names.insert(node.name.text)
+        return .visitChildren
     }
 }
 

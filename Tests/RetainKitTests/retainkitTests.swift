@@ -1082,4 +1082,237 @@ final class RetainKitTests: XCTestCase {
         var command = try Scan.parse([file.path, "--json", "--fail-on-error"])
         XCTAssertNoThrow(try command.run())
     }
+
+    // MARK: - Value types
+
+    func testClosureVisitor_skipsStructAndEnumMethods() {
+        let source = """
+        struct Counter {
+            var count = 0
+            func report() {
+                DispatchQueue.main.async { print(self.count) }
+            }
+        }
+        enum Mode {
+            case on, off
+            func report() {
+                DispatchQueue.main.async { print(self) }
+            }
+        }
+        """
+        XCTAssertTrue(closureIssues(source).isEmpty,
+                      "A struct or enum self is copied, not retained")
+    }
+
+    func testClosureVisitor_skipsExtensionOfValueTypeInSameFile() {
+        let source = """
+        struct Counter { var count = 0 }
+        extension Counter {
+            func report() {
+                DispatchQueue.main.async { print(self.count) }
+            }
+        }
+        """
+        XCTAssertTrue(closureIssues(source).isEmpty)
+    }
+
+    func testClosureVisitor_flagsExtensionOfUnresolvedType() {
+        let source = """
+        extension ViewController {
+            func report() {
+                DispatchQueue.main.async { self.update() }
+            }
+        }
+        """
+        XCTAssertEqual(closureIssues(source).map(\.kind), [.implicitSelf])
+    }
+
+    func testClosureVisitor_nearestEnclosingTypeDecides() {
+        let source = """
+        struct Outer {
+            class Inner {
+                func bar() { DispatchQueue.main.async { self.update() } }
+                func update() {}
+            }
+        }
+        class Host {
+            struct Value {
+                var x = 0
+                func bar() { DispatchQueue.main.async { print(self.x) } }
+            }
+            actor Worker {
+                func bar() { Task { await self.run() } }
+                func run() {}
+            }
+        }
+        """
+        XCTAssertEqual(closureIssues(source).map(\.line), [3, 13],
+                       "Class and actor are flagged; the struct nested in a class is not")
+    }
+
+    // MARK: - Local closure bindings
+
+    func testClosureVisitor_localBindingIsHintNotStored() {
+        let source = """
+        class Foo {
+            func bar() {
+                let handler = { self.update() }
+                handler()
+            }
+            func update() {}
+        }
+        """
+        let issues = closureIssues(source)
+        XCTAssertEqual(issues.map(\.kind), [.implicitSelf])
+        XCTAssertEqual(issues.map(\.severity), [.hint])
+        XCTAssertEqual(issues[0].detectionTrail[2].detail,
+                       "Assigned to a local variable; reported as a hint")
+    }
+
+    func testClosureVisitor_localBindingInsideClosureIsHint() {
+        let source = """
+        class Foo {
+            var items: [Int] = []
+            func bar() {
+                items.forEach { _ in
+                    var work: () -> Void = { [self] in self.update() }
+                    work()
+                }
+            }
+            func update() {}
+        }
+        """
+        let issues = closureIssues(source)
+        XCTAssertEqual(issues.map(\.kind), [.escapingClosure])
+        XCTAssertEqual(issues.map(\.severity), [.hint])
+    }
+
+    func testClosureVisitor_propertyInitializerIsStillStoredError() {
+        let source = """
+        class Foo {
+            var x = 0
+            lazy var handler: () -> Void = { self.x += 1 }
+            class Inner {
+                var y = 0
+                lazy var handler = { self.y += 1 }
+            }
+        }
+        """
+        let issues = closureIssues(source)
+        XCTAssertEqual(issues.map(\.kind), [.storedClosure, .storedClosure])
+        XCTAssertEqual(issues.map(\.severity), [.error, .error])
+    }
+
+    // MARK: - Generic types in the graph
+
+    func testReferenceGraph_genericTypeIsEdgeToItselfNotItsArgument() {
+        let source = """
+        class Payload { var box: Box<Payload>? }
+        class Box<T> { var value: T? }
+        final class Node<T> { var next: Node<T>? }
+        """
+        let issues = cycleIssues(source)
+        XCTAssertEqual(issues.map(\.message), ["Node.next: type refers to itself"],
+                       "Box<Payload> is an edge to Box, so Payload does not point at itself")
+        XCTAssertEqual(issues.map(\.severity), [.hint])
+    }
+
+    func testReferenceGraph_genericTypeTakesPartInCycles() {
+        let source = """
+        class Owner { var cache: Cache<String>? }
+        class Cache<Key> { var owner: Owner? }
+        """
+        XCTAssertEqual(cycleIssues(source).map(\.message),
+                       ["Retain cycle: Cache.owner → Owner.cache → Cache"])
+    }
+
+    func testReferenceGraph_unwrapsSpelledOutContainers() {
+        let properties = [
+            "var one: Optional<B> = nil",
+            "var many: Array<B> = []",
+            "var unique: Set<B> = []",
+        ]
+        for property in properties {
+            let source = """
+            class A { \(property) }
+            class B { var owners: Dictionary<String, A> = [:] }
+            """
+            let cycles = cycleIssues(source)
+            XCTAssertEqual(cycles.map(\.severity), [.error], property)
+        }
+    }
+
+    // MARK: - Same-named classes
+
+    private func write(_ files: [String: String], to dir: URL) throws {
+        for (name, source) in files {
+            try source.write(to: dir.appendingPathComponent(name),
+                             atomically: true, encoding: .utf8)
+        }
+    }
+
+    private func directoryCycles(_ files: [String: String]) throws -> [LeakIssue] {
+        let dir = try makeTempDirectory()
+        try write(files, to: dir)
+        return try DetectionEngine().analyzeDirectory(dir.path)
+            .flatMap(\.issues)
+            .filter { $0.kind == .referenceCycle }
+    }
+
+    func testReferenceGraph_sameNamedClassesInDifferentFilesStaySeparate() throws {
+        // Merged by name, one Helper node would carry both edges and report
+        // a short A → Helper → A cycle that does not exist.
+        let cycles = try directoryCycles([
+            "A.swift": "class A { var helper: Helper? }\nprivate class Helper { var b: B? }\n",
+            "B.swift": "class B { var helper: Helper? }\nprivate class Helper { var a: A? }\n",
+        ])
+        XCTAssertEqual(cycles.map(\.message),
+                       ["Retain cycle: A.helper → Helper.b → B.helper → Helper.a → A"],
+                       "Each Helper keeps its own edges and is resolved in its own file")
+    }
+
+    func testReferenceGraph_sameFileDeclarationWinsOverOtherFiles() throws {
+        let cycles = try directoryCycles([
+            "A.swift": "class A { var helper: Helper? }\nprivate class Helper { var a: A? }\n",
+            "B.swift": "private class Helper { var name: String = \"\" }\n",
+        ])
+        XCTAssertEqual(cycles.map(\.message), ["Retain cycle: A.helper → Helper.a → A"])
+    }
+
+    func testReferenceGraph_ambiguousNameAddsNoEdge() throws {
+        let cycles = try directoryCycles([
+            "A.swift": "class A { var model: Model? }\n",
+            "M1.swift": "class Model { var a: A? }\n",
+            "M2.swift": "class Model { var a: A? }\n",
+        ])
+        XCTAssertTrue(cycles.isEmpty,
+                      "A.model could be either Model, so no cycle is claimed")
+    }
+
+    func testReferenceGraph_nestedClassesWithSameNameStaySeparate() {
+        let source = """
+        class A {
+            var item: Item?
+            class Item { var name: String = "" }
+        }
+        class B {
+            var item: Item?
+            class Item { var owner: B? }
+        }
+        """
+        XCTAssertEqual(cycleIssues(source).map(\.message),
+                       ["Retain cycle: B.item → B.Item.owner → B"])
+    }
+
+    func testReferenceGraph_nestedTypeResolvesOutwards() {
+        let source = """
+        class Outer {
+            var shared: Shared?
+            class Shared { var inner: Inner? }
+            class Inner { var shared: Shared? }
+        }
+        """
+        XCTAssertEqual(cycleIssues(source).map(\.message),
+                       ["Retain cycle: Outer.Shared.inner → Outer.Inner.shared → Outer.Shared"])
+    }
 }
