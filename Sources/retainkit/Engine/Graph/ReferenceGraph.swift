@@ -38,9 +38,12 @@ struct GraphEdge {
 ///
 /// An edge is added for every stored, non-`weak`/`unowned` instance property
 /// with a type annotation. Computed properties and `static`/`class` members
-/// hold no instance reference and are skipped. Optionals, arrays, dictionary
-/// values and single-argument generics (`Array<B>`, `Set<B>`) are unwrapped
-/// to the type they contain.
+/// hold no instance reference and are skipped.
+///
+/// Standard containers are unwrapped to the type they hold: `B?`, `[B]`,
+/// `[K: B]`, `Optional<B>`, `Array<B>`, `Set<B>`, `Dictionary<K, B>`.
+/// Any other generic is an edge to the generic type itself, so `Node<T>`
+/// points at `Node`, not at `T`.
 ///
 /// Edges are between types, not instances. A class that refers to its own
 /// type (`var next: Node?`) is a normal linked list or tree, so it is reported
@@ -61,6 +64,11 @@ final class ReferenceGraph: SyntaxVisitor, SourceLocating {
     private static let backReferenceKeywords = [
         "delegate", "owner", "parent", "coordinator", "datasource",
         "presenter", "container", "superview", "root",
+    ]
+
+    /// Generic types that hold their single argument strongly.
+    private static let singleElementContainers: Set<String> = [
+        "Optional", "Array", "ContiguousArray", "ArraySlice", "Set",
     ]
 
     // MARK: - Context
@@ -261,11 +269,20 @@ final class ReferenceGraph: SyntaxVisitor, SourceLocating {
         if let dictionary = type.as(DictionaryTypeSyntax.self) {
             return extractTypeName(from: dictionary.value)
         }
-        if let identifier = type.as(IdentifierTypeSyntax.self),
-           let arguments = identifier.genericArgumentClause?.arguments,
-           arguments.count == 1,
-           let argument = arguments.first {
-            return extractTypeName(from: argument.argument)
+        if let identifier = type.as(IdentifierTypeSyntax.self) {
+            let name = identifier.name.text
+            guard let arguments = identifier.genericArgumentClause?.arguments else {
+                return name
+            }
+            if Self.singleElementContainers.contains(name), arguments.count == 1,
+               let element = arguments.first {
+                return extractTypeName(from: element.argument)
+            }
+            if name == "Dictionary", arguments.count == 2, let value = arguments.last {
+                return extractTypeName(from: value.argument)
+            }
+            // Node<T> refers to Node, whatever T is.
+            return name
         }
         return type.trimmedDescription
     }

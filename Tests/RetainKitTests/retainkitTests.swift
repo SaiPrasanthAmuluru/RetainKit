@@ -1202,4 +1202,43 @@ final class RetainKitTests: XCTestCase {
         XCTAssertEqual(issues.map(\.kind), [.storedClosure, .storedClosure])
         XCTAssertEqual(issues.map(\.severity), [.error, .error])
     }
+
+    // MARK: - Generic types in the graph
+
+    func testReferenceGraph_genericTypeIsEdgeToItselfNotItsArgument() {
+        let source = """
+        class Payload { var box: Box<Payload>? }
+        class Box<T> { var value: T? }
+        final class Node<T> { var next: Node<T>? }
+        """
+        let issues = cycleIssues(source)
+        XCTAssertEqual(issues.map(\.message), ["Node.next: type refers to itself"],
+                       "Box<Payload> is an edge to Box, so Payload does not point at itself")
+        XCTAssertEqual(issues.map(\.severity), [.hint])
+    }
+
+    func testReferenceGraph_genericTypeTakesPartInCycles() {
+        let source = """
+        class Owner { var cache: Cache<String>? }
+        class Cache<Key> { var owner: Owner? }
+        """
+        XCTAssertEqual(cycleIssues(source).map(\.message),
+                       ["Retain cycle: Cache.owner → Owner.cache → Cache"])
+    }
+
+    func testReferenceGraph_unwrapsSpelledOutContainers() {
+        let properties = [
+            "var one: Optional<B> = nil",
+            "var many: Array<B> = []",
+            "var unique: Set<B> = []",
+        ]
+        for property in properties {
+            let source = """
+            class A { \(property) }
+            class B { var owners: Dictionary<String, A> = [:] }
+            """
+            let cycles = cycleIssues(source)
+            XCTAssertEqual(cycles.map(\.severity), [.error], property)
+        }
+    }
 }
