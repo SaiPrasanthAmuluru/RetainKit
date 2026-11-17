@@ -24,7 +24,7 @@ scanned 1 files in 0.0s
 ## Requirements
 
 - macOS 13 or later
-- Swift 5.10 or later
+- Swift 6.0 or later (Xcode 16.1 or later)
 
 ## Install
 
