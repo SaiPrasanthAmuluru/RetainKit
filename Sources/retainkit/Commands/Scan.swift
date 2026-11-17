@@ -30,7 +30,7 @@ struct Scan: ParsableCommand {
     @Option(
         name: .long,
         help: ArgumentHelp(
-            "Skip files and directories matching this pattern. Repeat for several.",
+            "Skip files and directories matching this pattern in a directory scan. Repeat for several.",
             discussion: """
                 A pattern without "/" matches a file or directory name at any depth \
                 (Tests, *.generated.swift). A pattern with "/" is matched against the \
@@ -73,6 +73,9 @@ struct Scan: ParsableCommand {
         if isDirectory.boolValue {
             results = try engine.analyzeDirectory(path, excluding: try excludePatterns(for: url))
         } else {
+            // A file named directly is always scanned, so excludes don't apply.
+            // An explicit --config is still read, so a bad file is reported.
+            _ = try loadConfiguration(in: nil)
             let source = try String(contentsOf: url, encoding: .utf8)
             results = [engine.analyze(filePath: path, source: source)]
         }
@@ -93,18 +96,22 @@ struct Scan: ParsableCommand {
 
     // MARK: - Configuration
 
-    /// Combines the built-in excludes, the configuration file and `--exclude`.
-    func excludePatterns(for directory: URL) throws -> [String] {
-        let configuration: ScanConfiguration?
+    /// Reads `--config` if given, else `.retainkit.json` in `directory`.
+    /// Returns nil when neither exists.
+    func loadConfiguration(in directory: URL?) throws -> ScanConfiguration? {
         do {
             if let config {
-                configuration = try ScanConfiguration.load(from: URL(fileURLWithPath: config))
-            } else {
-                configuration = try ScanConfiguration.loadIfPresent(in: directory)
+                return try ScanConfiguration.load(from: URL(fileURLWithPath: config))
             }
+            return try directory.flatMap { try ScanConfiguration.loadIfPresent(in: $0) }
         } catch {
             throw ValidationError(error.localizedDescription)
         }
+    }
+
+    /// Combines the built-in excludes, the configuration file and `--exclude`.
+    func excludePatterns(for directory: URL) throws -> [String] {
+        let configuration = try loadConfiguration(in: directory)
 
         return (noDefaultExcludes ? [] : ScanConfiguration.defaultExcludes)
             + (configuration?.exclude ?? [])

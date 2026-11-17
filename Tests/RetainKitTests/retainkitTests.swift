@@ -1529,4 +1529,18 @@ final class RetainKitTests: XCTestCase {
         var invalid = try Scan.parse([dir.path, "--json"])
         XCTAssertThrowsError(try invalid.run())
     }
+
+    func testScan_singleFileIgnoresExcludesButValidatesExplicitConfig() throws {
+        let dir = try makeProject()
+        try write([".retainkit.json": "not json"], to: dir.appendingPathComponent("Tests"))
+        let file = dir.appendingPathComponent("Tests/MainTests.swift").path
+
+        // Excluded by pattern and beside an invalid .retainkit.json: still scanned.
+        var excluded = try Scan.parse([file, "--json", "--exclude", "Tests"])
+        XCTAssertNoThrow(try excluded.run())
+
+        var badConfig = try Scan.parse(
+            [file, "--json", "--config", dir.appendingPathComponent("nope.json").path])
+        XCTAssertThrowsError(try badConfig.run(), "An explicit --config is always validated")
+    }
 }

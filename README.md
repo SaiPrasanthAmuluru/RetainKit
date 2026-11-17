@@ -82,6 +82,8 @@ A pattern without `/` is matched against each file and directory name. A pattern
 
 Excluded files are not read at all, so they take no part in cycle detection either.
 
+Excludes apply to directory scans. A file passed directly, as in `retainkit scan Sources/Foo.swift`, is always scanned.
+
 ### Configuration file
 
 To keep the patterns with the project, put a `.retainkit.json` in the directory you scan:
@@ -92,7 +94,7 @@ To keep the patterns with the project, put a `.retainkit.json` in the directory 
 }
 ```
 
-Patterns from the file and from `--exclude` are combined. `--config <file>` reads a different file. A configuration file that is missing or not valid stops the scan with an error.
+Patterns from the file and from `--exclude` are combined. `--config <file>` reads a different file. A `.retainkit.json` that is not valid, or a `--config` file that is missing or not valid, stops the scan with an error. This holds for a single-file scan too, although only `--config` is read there.
 
 ## Rules
 
