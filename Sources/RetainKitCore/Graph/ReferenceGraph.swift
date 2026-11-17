@@ -348,12 +348,15 @@ final class ReferenceGraph: SyntaxVisitor, SourceLocating {
             guard let arguments = identifier.genericArgumentClause?.arguments else {
                 return name
             }
+            // A generic argument is a type or, since swift-syntax 601, a value
+            // expression (`InlineArray<3, Int>`). Only a type can be an edge.
             if Self.singleElementContainers.contains(name), arguments.count == 1,
-               let element = arguments.first {
-                return extractTypeName(from: element.argument)
+               let element = arguments.first.flatMap({ Syntax($0.argument).as(TypeSyntax.self) }) {
+                return extractTypeName(from: element)
             }
-            if name == "Dictionary", arguments.count == 2, let value = arguments.last {
-                return extractTypeName(from: value.argument)
+            if name == "Dictionary", arguments.count == 2,
+               let value = arguments.last.flatMap({ Syntax($0.argument).as(TypeSyntax.self) }) {
+                return extractTypeName(from: value)
             }
             // Node<T> refers to Node, whatever T is.
             return name

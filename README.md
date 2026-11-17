@@ -166,7 +166,7 @@ RetainKit reads syntax and resolves no types, so some results are approximate:
 - **Extensions of types from other files** are treated as possible classes.
 - **A type name declared in several files** is ambiguous in cycle detection and adds no edge.
 - **Timers and observers** are checked per class. `invalidate()` on any receiver counts as cleanup, and a `NotificationCenter` stored in a variable is not recognised.
-- **Syntax newer than Swift 5.10** may not parse, because the parser is swift-syntax 510.
+- **Syntax newer than the parser** may not parse. The pinned parser is swift-syntax 604 (Swift 6.4); a project that depends on `RetainKitCore` may resolve any release from 600 to 604.
 
 Treat errors as worth a look and hints as prompts, not proof.
 
