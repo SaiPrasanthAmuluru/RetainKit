@@ -124,6 +124,17 @@ A closure can only retain `self` if it outlives the call it is passed to. Retain
 - **Known escaping** (`async`, `Task`, `sink`, `dataTask`, …): reported at the rule's severity.
 - **Anything else**: reported as a hint.
 
+A Combine pipeline is the exception to the name rule. `map` on an array runs and returns, but `map` on a publisher is kept by the subscription, so every closure in a chain that contains a publisher (`$query`, `.publisher`, `Just(...)`) or a subscriber (`.sink`, `.assign`) is reported:
+
+```swift
+items.map { self.format($0) }                  // not reported
+
+$query
+    .map { self.normalise($0) }                // reported
+    .sink { self.search($0) }                  // reported
+    .store(in: &cancellables)
+```
+
 The two lists are in [`KnownEscaping.swift`](Sources/RetainKitCore/KnownEscaping.swift).
 
 ### What is never reported
@@ -197,7 +208,7 @@ let results = try engine.analyzeDirectory("Sources")
 
 RetainKit reads syntax and resolves no types, so some results are approximate:
 
-- **Escaping is decided by name.** `map` on a Combine publisher is treated as non-escaping, like `map` on an array.
+- **Escaping is decided by name.** A Combine chain is recognised by the publishers and subscribers written in it. A publisher held in a plain variable and transformed on a separate line (`let p = makePublisher(); p.map { ... }`) looks like a sequence and is not reported. Other reactive libraries and `AsyncSequence` are not recognised.
 - **Cycles are between types, not instances.** Two classes that reference each other are reported even if no two instances ever do.
 - **Extensions of types from other files** are treated as possible classes.
 - **A type name declared in several files** is ambiguous in cycle detection and adds no edge.
