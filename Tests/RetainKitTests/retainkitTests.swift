@@ -1605,6 +1605,19 @@ final class RetainKitTests: XCTestCase {
         XCTAssertTrue(closureIssues(source).isEmpty)
     }
 
+    func testClosureVisitor_shorthandArgumentReceiverIsNotAPublisher() {
+        let source = """
+        class Foo {
+            var groups: [Group] = []
+            func bar() {
+                _ = groups.flatMap { $0.items.map { self.format($0) } }
+                _ = groups.map { ($0, $1) }.map { $1.filter { self.keep($0) } }
+            }
+        }
+        """
+        XCTAssertTrue(closureIssues(source).isEmpty)
+    }
+
     func testClosureVisitor_weakSelfInPublisherChainIsSafe() {
         let source = """
         class Foo {

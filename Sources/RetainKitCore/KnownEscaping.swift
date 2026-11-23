@@ -88,7 +88,13 @@ enum KnownEscaping {
     /// A `$name` member is a property wrapper's projected value, which for
     /// `@Published` is its publisher.
     static func isReactiveChain(memberNames: [String]) -> Bool {
-        memberNames.contains { $0.hasPrefix("$") || reactiveMarkers.contains($0) }
+        memberNames.contains { isProjectedValue($0) || reactiveMarkers.contains($0) }
+    }
+
+    /// `$query` is a `@Published` projected value; `$0` and `$1` are
+    /// closure parameters and say nothing about the chain.
+    private static func isProjectedValue(_ name: String) -> Bool {
+        name.hasPrefix("$") && !name.dropFirst().allSatisfy(\.isNumber)
     }
 
     static func behavior(ofCallee name: String) -> EscapeBehavior {
