@@ -20,8 +20,10 @@ enum EscapeBehavior: Equatable {
 /// A name that appears in neither list is `.unknown`, which the closure rules
 /// report at hint severity instead of guessing.
 ///
-/// Limitation: the match ignores the receiver's type. `map` is treated as
-/// non-escaping, which is right for `Sequence` but not for a Combine publisher.
+/// The receiver's type is not known, so `map` on an array and `map` on a
+/// Combine publisher look alike by name. `isReactiveChain(memberNames:)`
+/// tells them apart from the rest of the call chain: every closure handed to
+/// an operator in a publisher chain is kept by the subscription.
 enum KnownEscaping {
 
     /// APIs that keep the closure after returning.
@@ -58,6 +60,36 @@ enum KnownEscaping {
         "withCheckedContinuation", "withCheckedThrowingContinuation",
         "withTaskGroup", "withThrowingTaskGroup",
     ]
+
+    /// Members that only appear in a Combine publisher chain: ways to get a
+    /// publisher, operators with no `Sequence` counterpart, and subscribers.
+    /// Everyday words that Combine also uses (`store`, `share`, `publish`)
+    /// are left out on purpose, so `cache.store.items.map { }` stays a
+    /// plain sequence call.
+    static let reactiveMarkers: Set<String> = [
+        // Sources
+        "publisher", "dataTaskPublisher", "objectWillChange",
+        "Just", "Future", "Deferred", "Empty", "Fail", "Publishers",
+        "PassthroughSubject", "CurrentValueSubject", "AnyPublisher",
+        // Operators
+        "eraseToAnyPublisher", "receive", "subscribe", "debounce", "throttle",
+        "removeDuplicates", "switchToLatest", "combineLatest",
+        "autoconnect", "handleEvents", "tryMap", "replaceError", "setFailureType",
+        // Subscribers
+        "sink", "assign",
+    ]
+
+    /// True when a call chain is a Combine pipeline.
+    ///
+    /// - Parameter memberNames: Every name in the chain a call belongs to,
+    ///   e.g. `["$query", "debounce", "map", "sink", "store"]` for
+    ///   `$query.debounce(...).map { }.sink { }.store(in: &bag)`.
+    ///
+    /// A `$name` member is a property wrapper's projected value, which for
+    /// `@Published` is its publisher.
+    static func isReactiveChain(memberNames: [String]) -> Bool {
+        memberNames.contains { $0.hasPrefix("$") || reactiveMarkers.contains($0) }
+    }
 
     static func behavior(ofCallee name: String) -> EscapeBehavior {
         if escaping.contains(name) { return .escaping }
