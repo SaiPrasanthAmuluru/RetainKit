@@ -1543,4 +1543,99 @@ final class RetainKitTests: XCTestCase {
             [file, "--json", "--config", dir.appendingPathComponent("nope.json").path])
         XCTAssertThrowsError(try badConfig.run(), "An explicit --config is always validated")
     }
+
+    // MARK: - Combine chains
+
+    func testClosureVisitor_flagsSequenceOperatorsInPublisherChain() {
+        let source = """
+        class Foo {
+            @Published var query = ""
+            var bag = Set<AnyCancellable>()
+            func bind() {
+                $query
+                    .debounce(for: 0.3, scheduler: RunLoop.main)
+                    .map { self.normalise($0) }
+                    .filter { !$0.isEmpty && self.isReady }
+                    .sink { self.search($0) }
+                    .store(in: &bag)
+            }
+        }
+        """
+        let issues = closureIssues(source)
+        XCTAssertEqual(issues.map(\.line), [7, 8, 9])
+        XCTAssertEqual(issues.map(\.severity), [.warning, .warning, .warning])
+        XCTAssertEqual(issues[0].detectionTrail[2].label, "Publisher chain")
+        XCTAssertEqual(issues[2].detectionTrail[2].label, "Escaping API")
+    }
+
+    func testClosureVisitor_recognisesPublisherSources() {
+        let sources = [
+            "NotificationCenter.default.publisher(for: .done).map { _ in self.count }",
+            "self.$name.map { $0 + self.suffix }",
+            "Just(1).map { $0 + self.count }",
+            "viewModel.objectWillChange.map { self.count }",
+            "subject.map { $0 + self.count }.eraseToAnyPublisher()",
+            "items.publisher.scan(0) { $0 + $1 + self.count }",
+            "service.load()?.map { self.decode($0) }.receive(on: queue)",
+        ]
+        for expression in sources {
+            let source = """
+            class Foo {
+                func bind() {
+                    _ = \(expression)
+                }
+            }
+            """
+            XCTAssertEqual(closureIssues(source).count, 1, expression)
+        }
+    }
+
+    func testClosureVisitor_plainSequenceCallsStayNonEscaping() {
+        let source = """
+        class Foo {
+            var items: [Int] = []
+            var cache = Cache()
+            func bar() {
+                _ = items.map { self.format($0) }.filter { self.keep($0) }.joined()
+                _ = cache.store.items.map { self.format($0) }
+                _ = items.lazy.compactMap { self.parse($0) }.first { self.keep($0) }
+            }
+        }
+        """
+        XCTAssertTrue(closureIssues(source).isEmpty)
+    }
+
+    func testClosureVisitor_shorthandArgumentReceiverIsNotAPublisher() {
+        let source = """
+        class Foo {
+            var groups: [Group] = []
+            func bar() {
+                _ = groups.flatMap { $0.items.map { self.format($0) } }
+                _ = groups.map { ($0, $1) }.map { $1.filter { self.keep($0) } }
+            }
+        }
+        """
+        XCTAssertTrue(closureIssues(source).isEmpty)
+    }
+
+    func testClosureVisitor_weakSelfInPublisherChainIsSafe() {
+        let source = """
+        class Foo {
+            func bind() {
+                $query
+                    .map { [weak self] in self?.normalise($0) }
+                    .sink { [weak self] in self?.search($0) }
+                    .store(in: &bag)
+            }
+        }
+        """
+        XCTAssertTrue(closureIssues(source).isEmpty)
+    }
+
+    func testKnownEscaping_reactiveChainDetection() {
+        XCTAssertTrue(KnownEscaping.isReactiveChain(memberNames: ["debounce", "$query", "sink"]))
+        XCTAssertTrue(KnownEscaping.isReactiveChain(memberNames: ["publisher"]))
+        XCTAssertFalse(KnownEscaping.isReactiveChain(memberNames: ["items", "filter", "joined"]))
+        XCTAssertFalse(KnownEscaping.isReactiveChain(memberNames: []))
+    }
 }

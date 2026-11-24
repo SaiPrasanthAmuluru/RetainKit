@@ -53,6 +53,9 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         case collection
         /// Passed to an API listed in `KnownEscaping.escaping`.
         case escapingCall(String)
+        /// Passed to an operator in a Combine publisher chain, where the
+        /// subscription keeps every closure in the pipeline.
+        case reactiveOperator(String)
         /// Runs before the enclosing expression finishes; cannot leak.
         case nonEscaping
         /// Passed to a callee RetainKit knows nothing about, or returned.
@@ -219,7 +222,7 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
             return .storedClosure
         case .collection:
             return .closureInCollection
-        case .escapingCall, .unknown, .local, .nonEscaping:
+        case .escapingCall, .reactiveOperator, .unknown, .local, .nonEscaping:
             // `[self]` is a deliberate strong capture; no capture list is LC-W002.
             return hasExplicitSelfCapture(node) ? .escapingClosure : .implicitSelf
         }
@@ -284,11 +287,63 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         guard let name = calleeName(of: call) else { return .unknown(nil) }
         if name == "append" || name == "insert" { return .collection }
 
-        switch KnownEscaping.behavior(ofCallee: name) {
-        case .escaping:    return .escapingCall(name)
-        case .nonEscaping: return .nonEscaping
-        case .unknown:     return .unknown(name)
+        let behavior = KnownEscaping.behavior(ofCallee: name)
+        if behavior == .escaping { return .escapingCall(name) }
+
+        // `map`, `filter` and friends run synchronously on a Sequence but are
+        // stored by the subscription on a publisher, as is any other operator.
+        if KnownEscaping.isReactiveChain(memberNames: chainMemberNames(around: call)) {
+            return .reactiveOperator(name)
         }
+        return behavior == .nonEscaping ? .nonEscaping : .unknown(name)
+    }
+
+    /// Names of the other members in the call chain that `call` is part of.
+    ///
+    /// For the `map` call in `$query.debounce(...).map { }.sink { }` this is
+    /// `["debounce", "$query", "sink"]`: what the call is made on, then what
+    /// is called on its result. The callee itself is left out.
+    private func chainMemberNames(around call: FunctionCallExprSyntax) -> [String] {
+        var names: [String] = []
+
+        // Upstream: the receiver, through calls, optional chaining and subscripts.
+        var receiver = call.calledExpression.as(MemberAccessExprSyntax.self)?.base
+        while let current = receiver {
+            if let member = current.as(MemberAccessExprSyntax.self) {
+                names.append(member.declName.baseName.text)
+                receiver = member.base
+            } else if let inner = current.as(FunctionCallExprSyntax.self) {
+                receiver = inner.calledExpression
+            } else if let inner = current.as(SubscriptCallExprSyntax.self) {
+                receiver = inner.calledExpression
+            } else if let inner = current.as(OptionalChainingExprSyntax.self) {
+                receiver = inner.expression
+            } else if let inner = current.as(ForceUnwrapExprSyntax.self) {
+                receiver = inner.expression
+            } else if let reference = current.as(DeclReferenceExprSyntax.self) {
+                names.append(reference.baseName.text)
+                receiver = nil
+            } else {
+                receiver = nil
+            }
+        }
+
+        // Downstream: members called on this call's result.
+        var node = Syntax(call)
+        while let parent = node.parent {
+            if let member = parent.as(MemberAccessExprSyntax.self), member.base?.id == node.id {
+                names.append(member.declName.baseName.text)
+            } else if let outer = parent.as(FunctionCallExprSyntax.self),
+                      outer.calledExpression.id == node.id {
+                // The call of the member just recorded.
+            } else if parent.is(OptionalChainingExprSyntax.self) || parent.is(ForceUnwrapExprSyntax.self) {
+                // Wrapper around the chain so far.
+            } else {
+                break
+            }
+            node = parent
+        }
+        return names
     }
 
     /// `queue.async` → "async", `Task` → "Task".
@@ -320,6 +375,9 @@ final class ClosureVisitor: SyntaxVisitor, SourceLocating {
         case .escapingCall(let name):
             escapeLabel = "Escaping API"
             escapeDetail = "`\(name)` is listed in KnownEscaping"
+        case .reactiveOperator(let name):
+            escapeLabel = "Publisher chain"
+            escapeDetail = "`\(name)` is an operator in a Combine chain; the subscription keeps its closure"
         case .unknown(let name):
             escapeLabel = "Escape not known"
             escapeDetail = name.map { "`\($0)` is not in KnownEscaping; reported as a hint" }
